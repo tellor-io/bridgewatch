@@ -1,0 +1,30 @@
+{
+  "networks": {
+    "sepolia": {
+      "chain_id": "layertest-4",
+      "bridge_address": "0xC69f43741D379cE93bdaAC9b5135EA3e697df1F8",
+      "layer_rpc_url": "https://node-palmito.tellorlayer.com"
+    }
+  },
+  "contracts": {
+    "function_selectors": {
+      "verifyOracleData": "0x5e0d3b0f",
+      "updateValidatorSet": "0x84330d4c"
+    },
+    "domain_separators": {
+      "new_report_attestation": "0x74656c6c6f7243757272656e744174746573746174696f6e0000000000000000",
+      "validator_set_hash": "0x636865636b706f696e7400000000000000000000000000000000000000000000"
+    }
+  },
+  "monitoring": {
+    "block_batch_size": 2000,
+    "max_retries": 3,
+    "retry_delay": 5,
+    "catchup_delay": 2,
+    "checkpoint_poll_interval": 60
+  },
+  "defaults": {
+    "monitoring_interval": 300,
+    "block_buffer": 5
+  }
+} 
