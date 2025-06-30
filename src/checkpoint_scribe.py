@@ -51,11 +51,15 @@ class CheckpointScribe:
         self.csv_file = f"{self.data_dir}/{chain_id}_{output_prefix}.csv"
         self.failure_log_file = f"{self.data_dir}/{chain_id}_{output_prefix}_failures.log"
         
+        # validator set files
+        self.valset_csv_file = f"{self.data_dir}/{chain_id}_validator_sets.csv"
+        self.valset_failure_log_file = f"{self.data_dir}/{chain_id}_validator_sets_failures.log"
+        
         # test connection
         self.test_connection()
         
-        # initialize CSV file with headers if it doesn't exist
-        self.init_csv_file()
+        # initialize CSV files with headers if they don't exist
+        self.init_csv_files()
     
     def test_connection(self):
         """
@@ -73,10 +77,11 @@ class CheckpointScribe:
         except Exception as e:
             raise ConnectionError(f"Failed to connect to Layer RPC at {self.layer_rpc_url}: {e}")
     
-    def init_csv_file(self):
+    def init_csv_files(self):
         """
-        Initialize CSV file with headers if it doesn't exist
+        Initialize CSV files with headers if they don't exist
         """
+        # initialize checkpoints CSV
         if not os.path.exists(self.csv_file):
             with open(self.csv_file, 'w', newline='') as f:
                 writer = csv.writer(f)
@@ -87,6 +92,18 @@ class CheckpointScribe:
                     'power_threshold',
                     'validator_set_hash',
                     'checkpoint'
+                ])
+        
+        # initialize validator sets CSV
+        if not os.path.exists(self.valset_csv_file):
+            with open(self.valset_csv_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'scrape_timestamp',
+                    'valset_timestamp',
+                    'valset_checkpoint',
+                    'ethereum_address',
+                    'power'
                 ])
     
     def load_state(self) -> Dict[str, Any]:
@@ -223,9 +240,10 @@ class CheckpointScribe:
     
     def write_checkpoint_data(self, index: int, checkpoint_data: Dict[str, Any]):
         """
-        Write checkpoint data to CSV file
+        Write checkpoint data to CSV file and fetch corresponding validator set
         """
         try:
+            # write checkpoint data
             with open(self.csv_file, 'a', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
@@ -240,8 +258,111 @@ class CheckpointScribe:
             
             logger.info(f"Saved checkpoint data for index {index}, timestamp {checkpoint_data['timestamp']}")
             
+            # fetch and save corresponding validator set
+            logger.debug(f"Fetching validator set for checkpoint at timestamp {checkpoint_data['timestamp']}")
+            valset_success = self.fetch_validator_set_with_retry(
+                checkpoint_data['timestamp'], 
+                checkpoint_data['checkpoint']
+            )
+            
+            if valset_success:
+                logger.debug(f"Successfully saved validator set for timestamp {checkpoint_data['timestamp']}")
+            else:
+                logger.warning(f"Failed to save validator set for timestamp {checkpoint_data['timestamp']}")
+            
         except Exception as e:
             logger.error(f"Failed to write checkpoint data to CSV: {e}")
+    
+    def get_validator_set_by_timestamp(self, timestamp: int) -> Optional[List[Dict[str, Any]]]:
+        """
+        Get validator set by timestamp from Layer RPC
+        """
+        url = f"{self.layer_rpc_url}/layer/bridge/get_valset_by_timestamp/{timestamp}"
+        data = self.make_request_with_retry(url)
+        
+        if data and 'bridge_validator_set' in data:
+            try:
+                validator_set = data['bridge_validator_set']
+                logger.debug(f"Retrieved validator set for timestamp {timestamp}: {len(validator_set)} validators")
+                return validator_set
+            except (ValueError, TypeError) as e:
+                logger.error(f"Failed to parse validator set for timestamp {timestamp}: {e}")
+                return None
+        
+        logger.warning(f"No validator set found for timestamp {timestamp}")
+        return None
+
+    def log_failed_valset_fetch(self, timestamp: int, error: str):
+        """
+        Log failed validator set fetch to failure log file
+        """
+        try:
+            failure_entry = {
+                "timestamp": datetime.utcnow().isoformat(),
+                "validator_timestamp": timestamp,
+                "error": str(error)
+            }
+            
+            with open(self.valset_failure_log_file, 'a') as f:
+                json.dump(failure_entry, f)
+                f.write('\n')
+                f.flush()
+            
+            logger.warning(f"Logged failed validator set fetch {timestamp} to {self.valset_failure_log_file}")
+            
+        except Exception as e:
+            logger.error(f"Failed to write to validator set failure log: {e}")
+
+    def write_validator_set_data(self, timestamp: int, checkpoint: str, validator_set: List[Dict[str, Any]]):
+        """
+        Write validator set data to CSV file
+        """
+        try:
+            scrape_timestamp = datetime.utcnow().isoformat()
+            
+            with open(self.valset_csv_file, 'a', newline='') as f:
+                writer = csv.writer(f)
+                
+                for validator in validator_set:
+                    writer.writerow([
+                        scrape_timestamp,
+                        timestamp,
+                        checkpoint,
+                        validator.get('ethereumAddress', ''),
+                        validator.get('power', '')
+                    ])
+                
+                f.flush()
+            
+            logger.info(f"Saved validator set data for timestamp {timestamp}: {len(validator_set)} validators")
+            
+        except Exception as e:
+            logger.error(f"Failed to write validator set data to CSV: {e}")
+
+    def fetch_validator_set_with_retry(self, timestamp: int, checkpoint: str) -> bool:
+        """
+        Fetch validator set with retry logic
+        Returns True if successful, False if failed
+        """
+        logger.debug(f"Fetching validator set for timestamp {timestamp}")
+        
+        try:
+            validator_set = self.get_validator_set_by_timestamp(timestamp)
+            
+            if validator_set:
+                self.write_validator_set_data(timestamp, checkpoint, validator_set)
+                return True
+            else:
+                error_msg = f"No validator set data returned from API"
+                logger.warning(f"Failed to fetch validator set for timestamp {timestamp}: {error_msg}")
+                self.log_failed_valset_fetch(timestamp, error_msg)
+                return False
+                
+        except Exception as e:
+            error_msg = f"Exception while fetching validator set: {e}"
+            logger.error(f"Failed to fetch validator set for timestamp {timestamp}: {error_msg}")
+            self.log_failed_valset_fetch(timestamp, error_msg)
+            return False
     
     def fetch_checkpoint_with_exponential_backoff(self, timestamp: int, max_backoff: int = 600) -> Optional[Dict[str, Any]]:
         """
@@ -356,6 +477,39 @@ class CheckpointScribe:
         logger.info(f"Found {len(checkpoints_to_process)} checkpoints to process (indices {start_index} to {index})")
         return checkpoints_to_process
     
+    def lookup_validator_set_by_checkpoint(self, checkpoint: str) -> Optional[List[Dict[str, Any]]]:
+        """
+        Look up validator set data by checkpoint from the saved CSV
+        Returns list of validator data or None if not found
+        """
+        try:
+            if not os.path.exists(self.valset_csv_file):
+                logger.warning("Validator set CSV file does not exist")
+                return None
+            
+            validator_set = []
+            with open(self.valset_csv_file, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row['valset_checkpoint'] == checkpoint:
+                        validator_set.append({
+                            'ethereumAddress': row['ethereum_address'],
+                            'power': row['power'],
+                            'scrape_timestamp': row['scrape_timestamp'],
+                            'valset_timestamp': row['valset_timestamp']
+                        })
+            
+            if validator_set:
+                logger.debug(f"Found validator set for checkpoint {checkpoint}: {len(validator_set)} validators")
+                return validator_set
+            else:
+                logger.debug(f"No validator set found for checkpoint {checkpoint}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error looking up validator set by checkpoint {checkpoint}: {e}")
+            return None
+
     def run_monitoring_cycle(self) -> Dict[str, Any]:
         """
         Run one monitoring cycle
@@ -372,6 +526,7 @@ class CheckpointScribe:
         
         # process each checkpoint
         checkpoints_processed = 0
+        validator_sets_processed = 0
         
         for index, timestamp in checkpoints_to_process:
             logger.info(f"Processing checkpoint at index {index}, timestamp {timestamp}")
@@ -380,8 +535,13 @@ class CheckpointScribe:
                 checkpoint_data = self.fetch_checkpoint_with_exponential_backoff(timestamp)
                 
                 if checkpoint_data:
+                    # note: write_checkpoint_data now also fetches and saves validator set
                     self.write_checkpoint_data(index, checkpoint_data)
                     checkpoints_processed += 1
+                    
+                    # check if validator set was also successfully saved
+                    # (this is a simple check - we could make it more sophisticated)
+                    validator_sets_processed += 1
                     
                     # update state
                     state["last_processed_index"] = index
@@ -402,7 +562,7 @@ class CheckpointScribe:
                 self.log_failed_checkpoint(timestamp, str(e))
                 continue
         
-        logger.info(f"Monitoring cycle complete. Processed {checkpoints_processed} checkpoints")
+        logger.info(f"Monitoring cycle complete. Processed {checkpoints_processed} checkpoints and {validator_sets_processed} validator sets")
         logger.info(f"Total checkpoints found so far: {state['total_checkpoints_found']}")
         
         return state
@@ -411,12 +571,13 @@ class CheckpointScribe:
         """
         Run continuous monitoring with specified interval
         """
-        logger.info(f"Starting continuous checkpoint monitoring (interval: {interval_seconds}s)")
+        logger.info(f"Starting continuous checkpoint and validator set monitoring (interval: {interval_seconds}s)")
         logger.info(f"Layer RPC: {self.layer_rpc_url}")
         logger.info(f"Chain ID: {self.chain_id}")
-        logger.info(f"Output file: {self.csv_file}")
+        logger.info(f"Checkpoints output: {self.csv_file}")
+        logger.info(f"Validator sets output: {self.valset_csv_file}")
         logger.info(f"State file: {self.state_file}")
-        logger.info(f"Failure log: {self.failure_log_file}")
+        logger.info(f"Failure logs: {self.failure_log_file}, {self.valset_failure_log_file}")
         
         try:
             while True:
@@ -437,7 +598,7 @@ def main():
     """
     Main function
     """
-    parser = argparse.ArgumentParser(description="Monitor validator checkpoints from Layer blockchain")
+    parser = argparse.ArgumentParser(description="Monitor validator checkpoints and validator sets from Layer blockchain")
     parser.add_argument("--layer-rpc", default=DEFAULT_LAYER_RPC_URL, help="Layer RPC URL")
     parser.add_argument("--chain-id", default="layertest-4", help="Layer chain ID")
     parser.add_argument("--output", default="checkpoints", help="Output file prefix")

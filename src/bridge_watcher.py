@@ -3,11 +3,11 @@
 Bridge Watcher - Unified Bridge Data Monitor
 
 This script orchestrates all bridge monitoring and validation components:
-1. checkpoint_scribe - collect Layer validator set checkpoints
-2. valset_watcher - monitor validator set updates  
-3. attest_watcher - monitor attestations
-4. valset_verifier - validate valset updates
-5. attest_verifier - validate attestations
+1. checkpoint_scribe - collect bridge validator sets and checkpoints from Layer
+2. valset_watcher - monitor validator set updates in evm data bridge contract
+3. attest_watcher - monitor attestations in evm data bridge contract
+4. valset_verifier - validate valset updates in bridge contract against Layer
+5. attest_verifier - validate attestations in bridge contract against Layer
 
 Usage:
     bridgewatch start [--once] [--interval 300]

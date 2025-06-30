@@ -6,8 +6,8 @@ This component validates attestations by:
 1. Decoding verifyOracleData calldata 
 2. Finding matching checkpoint for attestationTimestamp
 3. Calculating attestation snapshot
-4. Querying Layer to verify snapshot exists
 5. Validating signature against validator set
+4. Querying Layer to verify snapshot exists
 
 A "verifier" emphasizes analysis and truth-checking against Layer.
 """
@@ -24,6 +24,8 @@ import logging
 from datetime import datetime
 import os
 import hashlib
+from eth_keys import keys
+from eth_utils import decode_hex
 
 # configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -58,6 +60,13 @@ class AttestVerifier:
         
         # test connection to Layer
         self.test_layer_connection()
+        
+        # discord webhook URL (from environment variable)
+        self.discord_webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
+        if self.discord_webhook_url:
+            logger.info("Discord alerts enabled")
+        else:
+            logger.info("Discord alerts disabled (DISCORD_WEBHOOK_URL not set)")
     
     def test_layer_connection(self):
         """Test connection to Layer RPC"""
@@ -86,6 +95,9 @@ class AttestVerifier:
                     'snapshot',
                     'checkpoint_used',
                     'checkpoint_timestamp',
+                    'is_valid_validator_signature',
+                    'signing_validator_count',
+                    'signing_power_percentage',
                     'layer_snapshot_exists',
                     'signature_valid',
                     'status',
@@ -198,6 +210,239 @@ class AttestVerifier:
         
         logger.info(f"Loaded {len(attestations)} attestation calls")
         return attestations
+
+    def load_validator_set_by_checkpoint(self, checkpoint: str) -> Optional[List[Dict[str, Any]]]:
+        """
+        Load validator set data by checkpoint from validator sets CSV
+        """
+        valset_file = f"data/layer_checkpoints/{self.chain_id}_validator_sets.csv"
+        
+        if not os.path.exists(valset_file):
+            logger.warning(f"Validator set data not found: {valset_file}")
+            return None
+        
+        validator_set = []
+        try:
+            with open(valset_file, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row['valset_checkpoint'] == checkpoint:
+                        validator_set.append({
+                            'ethereumAddress': row['ethereum_address'],
+                            'power': int(row['power']),
+                            'scrape_timestamp': row['scrape_timestamp'],
+                            'valset_timestamp': row['valset_timestamp']
+                        })
+            
+            if validator_set:
+                logger.debug(f"Loaded validator set for checkpoint {checkpoint}: {len(validator_set)} validators")
+                return validator_set
+            else:
+                logger.warning(f"No validator set found for checkpoint {checkpoint}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error loading validator set for checkpoint {checkpoint}: {e}")
+            return None
+
+    def ecrecover_signature_with_validator_check(self, message_hash: bytes, signature: Dict[str, Any], 
+                                                validator_addresses: set) -> Optional[str]:
+        """
+        Recover Ethereum address from signature and message hash, trying both v values (27 and 28)
+        Returns the address only if it matches a validator in the set
+        """
+        try:
+            # extract signature components
+            r = signature.get('r', '0x0')
+            s = signature.get('s', '0x0')
+            
+            # skip empty signatures
+            if r == '0x0000000000000000000000000000000000000000000000000000000000000000':
+                return None
+            
+            # convert r and s to bytes
+            r_bytes = decode_hex(r)
+            s_bytes = decode_hex(s)
+            
+            # try both v values (27 and 28) since cosmos-sdk doesn't provide v
+            for v_recovery in [0, 1]:  # eth_keys uses 0,1 instead of 27,28
+                try:
+                    # create signature object
+                    signature_obj = keys.Signature(vrs=(
+                        v_recovery,
+                        int.from_bytes(r_bytes, byteorder='big'),
+                        int.from_bytes(s_bytes, byteorder='big')
+                    ))
+                    
+                    # recover public key from signature and message hash
+                    public_key = signature_obj.recover_public_key_from_msg_hash(message_hash)
+                    
+                    # get address from public key
+                    address = public_key.to_checksum_address()
+                    
+                    # check if this recovered address is in the validator set
+                    if address.lower() in validator_addresses:
+                        logger.debug(f"Valid signature recovered with v={v_recovery+27}: {address}")
+                        return address
+                    else:
+                        logger.debug(f"Recovered address {address} (v={v_recovery+27}) not in validator set, trying next v value")
+                    
+                except Exception as e:
+                    logger.debug(f"Failed to recover with v={v_recovery+27}: {e}")
+                    continue
+            
+            # no valid validator address found with either v value
+            logger.debug("No valid validator address recovered with either v=27 or v=28")
+            return None
+            
+        except Exception as e:
+            logger.debug(f"Error recovering signature: {e}")
+            return None
+
+    def verify_signature_against_validators(self, snapshot: str, signatures: List[Dict[str, Any]], 
+                                          validator_set: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Verify if any signature in the list was signed by a validator in the set
+        Returns dict with verification result
+        """
+        try:
+            # sha256 hash the snapshot as mentioned by user
+            snapshot_bytes = decode_hex(snapshot)
+            message_hash = hashlib.sha256(snapshot_bytes).digest()
+            
+            # create validator address lookup
+            validator_addresses = {v['ethereumAddress'].lower() for v in validator_set}
+            total_validator_power = sum(v['power'] for v in validator_set)
+            
+            verified_signatures = []
+            total_signing_power = 0
+            
+            for i, signature in enumerate(signatures):
+                # try to recover signature with both v values and check against validator set
+                recovered_address = self.ecrecover_signature_with_validator_check(
+                    message_hash, signature, validator_addresses
+                )
+                
+                if recovered_address:
+                    # find the validator's power
+                    validator_power = next(
+                        (v['power'] for v in validator_set if v['ethereumAddress'].lower() == recovered_address.lower()),
+                        0
+                    )
+                    
+                    verified_signatures.append({
+                        'index': i,
+                        'address': recovered_address,
+                        'power': validator_power
+                    })
+                    total_signing_power += validator_power
+                    
+                    logger.debug(f"Valid signature from validator {recovered_address} with power {validator_power}")
+                else:
+                    logger.debug(f"Signature {i} not from valid validator (tried both v=27 and v=28)")
+            
+            is_valid = len(verified_signatures) > 0
+            
+            return {
+                'is_valid_validator': is_valid,
+                'verified_signatures': verified_signatures,
+                'total_signing_power': total_signing_power,
+                'total_validator_power': total_validator_power,
+                'signing_percentage': (total_signing_power / total_validator_power * 100) if total_validator_power > 0 else 0
+            }
+            
+        except Exception as e:
+            logger.error(f"Error verifying signature against validators: {e}")
+            return {
+                'is_valid_validator': False,
+                'verified_signatures': [],
+                'total_signing_power': 0,
+                'total_validator_power': 0,
+                'signing_percentage': 0
+            }
+
+    def send_discord_alert(self, alert_type: str, attestation_data: Dict[str, Any], validation_result: Dict[str, Any]):
+        """
+        Send Discord alert for malicious attestations from valid validators
+        """
+        if not self.discord_webhook_url:
+            logger.debug("Discord webhook URL not configured, skipping alert")
+            return
+        
+        try:
+            if alert_type == "malicious_attestation":
+                title = "🚨 MALICIOUS ATTESTATION DETECTED"
+                color = 0xFF0000  # red
+                description = "A malicious attestation was signed by a valid Tellor validator!"
+            elif alert_type == "malicious_valset":
+                title = "⚠️ MALICIOUS VALIDATOR SET UPDATE"
+                color = 0xFF8C00  # orange
+                description = "A malicious validator set update was detected!"
+            else:
+                return
+            
+            # build embed
+            embed = {
+                "title": title,
+                "description": description,
+                "color": color,
+                "timestamp": datetime.utcnow().isoformat(),
+                "fields": [
+                    {
+                        "name": "Transaction Hash",
+                        "value": f"`{attestation_data.get('tx_hash', 'Unknown')}`",
+                        "inline": True
+                    },
+                    {
+                        "name": "Block Number",
+                        "value": str(attestation_data.get('block_number', 'Unknown')),
+                        "inline": True
+                    },
+                    {
+                        "name": "Query ID",
+                        "value": f"`{validation_result.get('query_id', 'Unknown')}`",
+                        "inline": False
+                    },
+                    {
+                        "name": "Snapshot",
+                        "value": f"`{validation_result.get('snapshot', 'Unknown')[:20]}...`",
+                        "inline": False
+                    }
+                ]
+            }
+            
+            # add validator info if available
+            if 'signature_verification' in validation_result:
+                sig_result = validation_result['signature_verification']
+                verified_sigs = sig_result.get('verified_signatures', [])
+                if verified_sigs:
+                    validator_info = []
+                    for sig in verified_sigs[:3]:  # limit to first 3
+                        validator_info.append(f"`{sig['address'][:10]}...` (Power: {sig['power']})")
+                    
+                    embed["fields"].append({
+                        "name": "Signing Validators",
+                        "value": "\n".join(validator_info),
+                        "inline": False
+                    })
+                    
+                    embed["fields"].append({
+                        "name": "Signing Power",
+                        "value": f"{sig_result.get('signing_percentage', 0):.1f}% ({sig_result.get('total_signing_power', 0)}/{sig_result.get('total_validator_power', 0)})",
+                        "inline": True
+                    })
+            
+            payload = {
+                "embeds": [embed]
+            }
+            
+            response = requests.post(self.discord_webhook_url, json=payload, timeout=10)
+            response.raise_for_status()
+            
+            logger.info(f"Discord alert sent for {alert_type}: {attestation_data.get('tx_hash', 'Unknown')}")
+            
+        except Exception as e:
+            logger.error(f"Failed to send Discord alert: {e}")
     
     def decode_verify_oracle_data_calldata(self, input_data: str) -> Optional[Dict[str, Any]]:
         """
@@ -396,19 +641,21 @@ class AttestVerifier:
             return False
     
     def validate_signature(self, attestation_data: Dict[str, Any], validator_set: List[Dict[str, Any]], 
-                          signatures: List[Dict[str, Any]], snapshot: str) -> bool:
+                          signatures: List[Dict[str, Any]], snapshot: str) -> Dict[str, Any]:
         """
-        Validate the first signature against the validator set
+        Validate signatures against the validator set
+        Returns dict with validation results
         """
-        # placeholder implementation
-        # proper implementation would:
-        # 1. Extract the first non-empty signature
-        # 2. Recover the address from signature + snapshot
-        # 3. Check if recovered address is in validator set
-        # 4. Check if validator has sufficient power
+        if not validator_set or not signatures:
+            return {
+                'is_valid_validator': False,
+                'verified_signatures': [],
+                'total_signing_power': 0,
+                'total_validator_power': 0,
+                'signing_percentage': 0
+            }
         
-        logger.debug("Signature validation not fully implemented")
-        return True  # placeholder
+        return self.verify_signature_against_validators(snapshot, signatures, validator_set)
     
     def validate_attestation(self, attestation: Dict[str, Any], checkpoints: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -426,6 +673,9 @@ class AttestVerifier:
             'snapshot': None,
             'checkpoint_used': None,
             'checkpoint_timestamp': None,
+            'is_valid_validator_signature': False,
+            'signing_validator_count': 0,
+            'signing_power_percentage': 0.0,
             'layer_snapshot_exists': False,
             'signature_valid': False,
             'status': 'FAILED',
@@ -462,34 +712,61 @@ class AttestVerifier:
             result['checkpoint_used'] = matching_checkpoint['checkpoint']
             result['checkpoint_timestamp'] = matching_checkpoint['timestamp']
             
-            # step 3: calculate snapshot
+                        # step 3: load validator set for the checkpoint
+            validator_set = self.load_validator_set_by_checkpoint(matching_checkpoint['checkpoint'])
+            if not validator_set:
+                result['error_details'] = 'Failed to load validator set for checkpoint'
+                return result
+
+            # step 4: calculate snapshot
             snapshot = self.calculate_attestation_snapshot(decoded_data, matching_checkpoint['checkpoint'])
             if not snapshot:
                 result['error_details'] = 'Failed to calculate snapshot'
                 return result
-            
+
             result['snapshot'] = snapshot
             
-            # step 4: query Layer
-            layer_exists = self.query_layer_snapshot(snapshot)
-            result['layer_snapshot_exists'] = layer_exists
-            
-            if not layer_exists:
-                result['status'] = 'MALICIOUS'
-                result['error_details'] = 'Snapshot does not exist on Layer'
-                return result
-            
-            # step 5: validate signature (optional)
-            sig_valid = self.validate_signature(
+            # step 5: verify signatures against Tellor validator set FIRST
+            signature_verification = self.validate_signature(
                 decoded_data, 
-                decoded_data.get('validators', []),
+                validator_set,
                 decoded_data.get('signatures', []),
                 snapshot
             )
-            result['signature_valid'] = sig_valid
             
-            if layer_exists:
-                result['status'] = 'VALID'
+            result['is_valid_validator_signature'] = signature_verification['is_valid_validator']
+            result['signing_validator_count'] = len(signature_verification['verified_signatures'])
+            result['signing_power_percentage'] = signature_verification['signing_percentage']
+            result['signature_verification'] = signature_verification  # store for Discord alerts
+            
+            # only proceed with Layer verification if signatures are from valid validators
+            if not signature_verification['is_valid_validator']:
+                result['status'] = 'INVALID_SIGNATURE'
+                result['error_details'] = 'Attestation not signed by valid Tellor validators'
+                result['signature_valid'] = False
+                logger.debug(f"Skipping Layer verification for {attestation['tx_hash']} - invalid validator signature")
+                return result
+            
+            logger.info(f"Valid validator signature detected: {len(signature_verification['verified_signatures'])} validators, "
+                       f"{signature_verification['signing_percentage']:.1f}% power")
+            
+            # step 6: query Layer (only for attestations signed by valid validators)
+            layer_exists = self.query_layer_snapshot(snapshot)
+            result['layer_snapshot_exists'] = layer_exists
+            result['signature_valid'] = True
+            
+            if not layer_exists:
+                result['status'] = 'MALICIOUS'
+                result['error_details'] = 'Snapshot does not exist on Layer - MALICIOUS ATTESTATION FROM VALID VALIDATOR'
+                
+                # send Discord alert for malicious attestation from valid validator
+                logger.warning(f"🚨 MALICIOUS ATTESTATION from valid validators: {attestation['tx_hash']}")
+                self.send_discord_alert('malicious_attestation', attestation, result)
+                
+                return result
+
+            # attestation is valid
+            result['status'] = 'VALID'
             
         except Exception as e:
             result['error_details'] = str(e)
@@ -514,6 +791,9 @@ class AttestVerifier:
                     result['snapshot'],
                     result['checkpoint_used'],
                     result['checkpoint_timestamp'],
+                    result['is_valid_validator_signature'],
+                    result['signing_validator_count'],
+                    result['signing_power_percentage'],
                     result['layer_snapshot_exists'],
                     result['signature_valid'],
                     result['status'],
@@ -556,6 +836,7 @@ class AttestVerifier:
         # validate each attestation
         valid_count = 0
         malicious_count = 0
+        invalid_signature_count = 0
         error_count = 0
         processed_count = 0
         
@@ -571,6 +852,9 @@ class AttestVerifier:
             elif result['status'] == 'MALICIOUS':
                 malicious_count += 1
                 logger.warning(f"🚨 MALICIOUS ATTESTATION DETECTED: {attestation['tx_hash']}")
+            elif result['status'] == 'INVALID_SIGNATURE':
+                invalid_signature_count += 1
+                logger.debug(f"Invalid signature from non-validator: {attestation['tx_hash']}")
             else:
                 error_count += 1
             
@@ -591,17 +875,24 @@ class AttestVerifier:
         logger.info(f"  📊 Processed: {processed_count} new attestations")
         logger.info(f"  ✅ Valid: {valid_count}")
         logger.info(f"  🚨 Malicious: {malicious_count}")
+        logger.info(f"  🔒 Invalid signatures: {invalid_signature_count}")
         logger.info(f"  ❌ Errors: {error_count}")
         logger.info(f"  📈 Total validations: {state['total_validations']}")
         logger.info(f"Results saved to: {self.results_file}")
         logger.info(f"State saved to: {self.state_file}")
+        
+        if malicious_count > 0:
+            logger.warning(f"🚨 {malicious_count} malicious attestations detected from valid validators!")
+        if invalid_signature_count > 0:
+            logger.info(f"🔒 {invalid_signature_count} attestations filtered out (invalid validator signatures)")
 
 def main():
     """Main function"""
-    parser = argparse.ArgumentParser(description="Validate attestations against Layer blockchain data")
+    parser = argparse.ArgumentParser(description="Validate attestations against Layer blockchain data with validator signature verification")
     parser.add_argument("--layer-rpc", default=DEFAULT_LAYER_RPC_URL, help="Layer RPC URL")
     parser.add_argument("--chain-id", default="layertest-4", help="Layer chain ID")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
+    parser.add_argument("--test-discord", action="store_true", help="Test Discord webhook")
     
     args = parser.parse_args()
     
@@ -610,7 +901,28 @@ def main():
     
     try:
         verifier = AttestVerifier(args.layer_rpc, args.chain_id)
-        verifier.validate_all_attestations()
+        
+        if args.test_discord:
+            # test Discord webhook
+            test_data = {
+                'tx_hash': '0x1234567890abcdef...',
+                'block_number': 12345
+            }
+            test_result = {
+                'query_id': '0xabcdef...',
+                'snapshot': '0x1234567890abcdef1234567890abcdef...',
+                'signature_verification': {
+                    'verified_signatures': [{'address': '0x1234...', 'power': 1000}],
+                    'signing_percentage': 25.5,
+                    'total_signing_power': 1000,
+                    'total_validator_power': 4000
+                }
+            }
+            logger.info("Testing Discord webhook...")
+            verifier.send_discord_alert('malicious_attestation', test_data, test_result)
+            logger.info("Discord test complete")
+        else:
+            verifier.validate_all_attestations()
         
     except Exception as e:
         logger.error(f"Validation failed: {e}")
