@@ -34,14 +34,24 @@ from valset_watcher import ValsetWatcher
 from attest_watcher import AttestWatcher
 from valset_verifier import ValsetVerifier
 from attest_verifier import AttestVerifier
-from config import config
+from config import config, get_config_manager
 
 class BridgeWatcher:
     def __init__(self):
         self.running = False
         
+        # get config manager for directory paths
+        try:
+            config_manager = get_config_manager()
+            data_dir = config_manager.get_data_dir()
+            self.state_file = f"{data_dir}/bridge_watcher_state.json"
+        except RuntimeError:
+            # fallback to legacy paths if in legacy mode
+            data_dir = "data"
+            self.state_file = "data/bridge_watcher_state.json"
+        
         # create main data directory
-        os.makedirs("data", exist_ok=True)
+        os.makedirs(data_dir, exist_ok=True)
         
         # initialize components using config system
         self.checkpoint_scribe = CheckpointScribe(
@@ -72,9 +82,6 @@ class BridgeWatcher:
             layer_rpc_url=config.get_layer_rpc_url(),
             chain_id=config.get_chain_id()
         )
-        
-        # state file for the overall watcher
-        self.state_file = "data/bridge_watcher_state.json"
         
         # setup signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -173,6 +180,15 @@ class BridgeWatcher:
     def run_continuous(self, interval_seconds: int = 300):
         """Run continuous monitoring with specified interval"""
         logger.info(f"🚀 Starting continuous bridge monitoring (interval: {interval_seconds}s)")
+        
+        # show configuration information
+        try:
+            config_manager = get_config_manager()
+            logger.info(f"📋 Active Config: {config_manager.get_display_name()}")
+            logger.info(f"📂 Data Directory: {config_manager.get_data_dir()}")
+        except RuntimeError:
+            logger.info("📋 Active Config: Legacy Mode")
+        
         logger.info(f"📍 Layer RPC: {config.get_layer_rpc_url()}")
         logger.info(f"📍 EVM RPC: {config.get_evm_rpc_url()}")
         logger.info(f"📍 Bridge Address: {config.get_bridge_address()}")
@@ -233,6 +249,24 @@ class BridgeWatcher:
         
         # load states from all components
         try:
+            # get config manager for directory paths
+            try:
+                config_manager = get_config_manager()
+                checkpoint_dir = config_manager.get_layer_checkpoints_dir()
+                valset_dir = config_manager.get_valset_dir()
+                oracle_dir = config_manager.get_oracle_dir()
+                validation_dir = config_manager.get_validation_dir()
+                print(f"📋 Active Config: {config_manager.get_display_name()}")
+                print(f"📂 Data Directory: {config_manager.get_data_dir()}")
+            except RuntimeError:
+                # fallback to legacy paths if in legacy mode
+                checkpoint_dir = "data/layer_checkpoints"
+                valset_dir = "data/valset"
+                oracle_dir = "data/oracle"
+                validation_dir = "data/validation"
+                print("📋 Active Config: Legacy Mode")
+                print("📂 Data Directory: data/")
+            
             watcher_state = self.load_watcher_state()
             checkpoint_state = self.checkpoint_scribe.load_state()
             valset_state = self.valset_watcher.load_state()
@@ -263,11 +297,11 @@ class BridgeWatcher:
             
             chain_id = config.get_chain_id()
             data_files = [
-                f"data/layer_checkpoints/{chain_id}_checkpoints.csv",
-                "data/valset/valset_updates.csv", 
-                "data/oracle/attestations.csv",
-                f"data/validation/{chain_id}_valset_validation_results.csv",
-                f"data/validation/{chain_id}_attestation_validation_results.csv"
+                f"{checkpoint_dir}/{chain_id}_checkpoints.csv",
+                f"{valset_dir}/valset_updates.csv", 
+                f"{oracle_dir}/attestations.csv",
+                f"{validation_dir}/{chain_id}_valset_validation_results.csv",
+                f"{validation_dir}/{chain_id}_attestation_validation_results.csv"
             ]
             
             for file_path in data_files:
@@ -284,14 +318,30 @@ class BridgeWatcher:
         """Reset all state files (keeps data files)"""
         logger.warning("🗑️  Resetting all state files...")
         
+        # get config manager for directory paths
+        try:
+            config_manager = get_config_manager()
+            checkpoint_dir = config_manager.get_layer_checkpoints_dir()
+            valset_dir = config_manager.get_valset_dir()
+            oracle_dir = config_manager.get_oracle_dir()
+            validation_dir = config_manager.get_validation_dir()
+            bridge_state_file = f"{config_manager.get_data_dir()}/bridge_watcher_state.json"
+        except RuntimeError:
+            # fallback to legacy paths if in legacy mode
+            checkpoint_dir = "data/layer_checkpoints"
+            valset_dir = "data/valset"
+            oracle_dir = "data/oracle"
+            validation_dir = "data/validation"
+            bridge_state_file = "data/bridge_watcher_state.json"
+        
         chain_id = config.get_chain_id()
         state_files = [
-            "data/bridge_watcher_state.json",
-            f"data/layer_checkpoints/{chain_id}_checkpoints_state.json",
-            "data/valset/valset_updates_state.json",
-            "data/oracle/attestations_state.json", 
-            f"data/validation/{chain_id}_valset_validation_state.json",
-            f"data/validation/{chain_id}_attestation_validation_state.json"
+            bridge_state_file,
+            f"{checkpoint_dir}/{chain_id}_checkpoints_state.json",
+            f"{valset_dir}/valset_updates_state.json",
+            f"{oracle_dir}/attestations_state.json", 
+            f"{validation_dir}/{chain_id}_valset_validation_state.json",
+            f"{validation_dir}/{chain_id}_attestation_validation_state.json"
         ]
         
         removed_count = 0
@@ -331,6 +381,10 @@ Examples:
   bridgewatch status --no-color      # show status without colors
   bridgewatch reset                  # reset all progress
   bridgewatch test-discord           # test Discord webhook alerts
+  bridgewatch config list            # list all available configurations
+  bridgewatch config show            # show active configuration details
+  bridgewatch config switch <name>   # switch to different configuration
+  bridgewatch config validate        # validate current configuration
         """
     )
     
@@ -361,6 +415,27 @@ Examples:
     discord_parser = subparsers.add_parser('test-discord', help='Test Discord webhook')
     discord_parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     discord_parser.add_argument('--no-color', action='store_true', help='Disable colored output')
+    
+    # config command with subcommands
+    config_parser = subparsers.add_parser('config', help='Configuration management')
+    config_parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
+    config_parser.add_argument('--no-color', action='store_true', help='Disable colored output')
+    
+    config_subparsers = config_parser.add_subparsers(dest='config_command', help='Config commands')
+    
+    # config list
+    config_list_parser = config_subparsers.add_parser('list', help='List all available configurations')
+    
+    # config show
+    config_show_parser = config_subparsers.add_parser('show', help='Show active configuration details')
+    
+    # config switch
+    config_switch_parser = config_subparsers.add_parser('switch', help='Switch active configuration')
+    config_switch_parser.add_argument('config_name', help='Name of configuration to switch to')
+    
+    # config validate
+    config_validate_parser = config_subparsers.add_parser('validate', help='Validate current configuration')
+    config_validate_parser.add_argument('config_name', nargs='?', help='Configuration to validate (default: active config)')
     
     args = parser.parse_args()
     
@@ -432,6 +507,91 @@ Examples:
             except Exception as e:
                 logger.error(f"❌ Discord test failed: {e}")
                 sys.exit(1)
+        
+        elif args.command == 'config':
+            # handle configuration commands
+            if not hasattr(args, 'config_command') or args.config_command is None:
+                logger.error("❌ No config subcommand specified")
+                logger.info("💡 Use 'bridgewatch config --help' for available commands")
+                sys.exit(1)
+            
+            try:
+                config_manager = get_config_manager()
+            except Exception as e:
+                logger.error(f"❌ Failed to load configuration: {e}")
+                sys.exit(1)
+            
+            if args.config_command == 'list':
+                logger.info("📋 Available Configurations:")
+                configs = config_manager.list_configs()
+                active_config = config_manager.get_active_config_name()
+                
+                for name, display_name in configs.items():
+                    marker = "🔸" if name == active_config else "  "
+                    print(f"{marker} {name}: {display_name}")
+                
+                print(f"\n✅ Active: {active_config}")
+                
+            elif args.config_command == 'show':
+                logger.info("📋 Active Configuration Details:")
+                active_config = config_manager.get_active_config()
+                active_name = config_manager.get_active_config_name()
+                
+                print(f"Name: {active_name}")
+                print(f"Display Name: {active_config.get('display_name', active_name)}")
+                print(f"Layer Chain: {active_config.get('layer_chain')}")
+                print(f"EVM Chain: {active_config.get('evm_chain')}")
+                print(f"Bridge Contract: {active_config.get('bridge_contract')}")
+                print(f"Layer RPC: {active_config.get('layer_rpc_url')}")
+                print(f"EVM RPC: {active_config.get('evm_rpc_url')}")
+                print(f"Data Directory: {active_config.get('data_dir')}")
+                
+                # validate config
+                validation = config_manager.validate_config()
+                if validation['valid']:
+                    print("✅ Configuration is valid")
+                else:
+                    print("❌ Configuration has issues:")
+                    for error in validation['errors']:
+                        print(f"  • {error}")
+                    for warning in validation['warnings']:
+                        print(f"  ⚠️ {warning}")
+                
+            elif args.config_command == 'switch':
+                config_name = args.config_name
+                logger.info(f"🔄 Switching to configuration: {config_name}")
+                
+                try:
+                    config_manager.switch_config(config_name)
+                    logger.info(f"✅ Successfully switched to '{config_name}'")
+                    logger.info("💡 This change affects the current session only")
+                    logger.info("💡 Set ACTIVE_CONFIG in your .env file to make it permanent")
+                except ValueError as e:
+                    logger.error(f"❌ {e}")
+                    sys.exit(1)
+                
+            elif args.config_command == 'validate':
+                config_name = args.config_name
+                if config_name:
+                    logger.info(f"🔍 Validating configuration: {config_name}")
+                else:
+                    config_name = config_manager.get_active_config_name()
+                    logger.info(f"🔍 Validating active configuration: {config_name}")
+                
+                validation = config_manager.validate_config(config_name)
+                
+                if validation['valid']:
+                    logger.info("✅ Configuration is valid")
+                else:
+                    logger.error("❌ Configuration validation failed:")
+                    for error in validation['errors']:
+                        print(f"  • {error}")
+                    sys.exit(1)
+                
+                if validation['warnings']:
+                    logger.warning("⚠️ Configuration warnings:")
+                    for warning in validation['warnings']:
+                        print(f"  • {warning}")
             
     except Exception as e:
         logger.error(f"Fatal error: {e}")

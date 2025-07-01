@@ -31,7 +31,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # import config
-from config import config
+from config import config, get_config_manager
 
 # configuration from config module
 DEFAULT_LAYER_RPC_URL = config.get_layer_rpc_url()
@@ -45,14 +45,25 @@ class AttestVerifier:
         self.chain_id = chain_id
         self.w3 = Web3()  # for ABI decoding only
         
-        # create output directory
-        self.data_dir = f"data/validation"
+        # get config manager for directory paths
+        try:
+            config_manager = get_config_manager()
+            self.data_dir = config_manager.get_validation_dir()
+            self.checkpoint_dir = config_manager.get_layer_checkpoints_dir()
+            self.oracle_dir = config_manager.get_oracle_dir()
+        except RuntimeError:
+            # fallback to legacy paths if in legacy mode
+            self.data_dir = f"data/validation"
+            self.checkpoint_dir = f"data/layer_checkpoints"
+            self.oracle_dir = f"data/oracle"
+        
+        # create data directory
         os.makedirs(self.data_dir, exist_ok=True)
         
         # output files
-        self.results_file = f"{self.data_dir}/{chain_id}_attestation_validation_results.csv"
-        self.failure_log_file = f"{self.data_dir}/{chain_id}_attestation_validation_failures.log"
         self.state_file = f"{self.data_dir}/{chain_id}_attestation_validation_state.json"
+        self.validation_csv_file = f"{self.data_dir}/{chain_id}_attestation_validation_results.csv"
+        self.failure_log_file = f"{self.data_dir}/{chain_id}_attestation_validation_failures.log"
         
         # initialize CSV file
         self.init_results_csv()
@@ -79,8 +90,8 @@ class AttestVerifier:
     
     def init_results_csv(self):
         """Initialize results CSV file"""
-        if not os.path.exists(self.results_file):
-            with open(self.results_file, 'w', newline='') as f:
+        if not os.path.exists(self.validation_csv_file):
+            with open(self.validation_csv_file, 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
                     'validation_timestamp',
@@ -159,7 +170,7 @@ class AttestVerifier:
     
     def load_checkpoint_data(self) -> List[Dict[str, Any]]:
         """Load checkpoint data from checkpoint_scribe"""
-        checkpoint_file = f"data/layer_checkpoints/{self.chain_id}_checkpoints.csv"
+        checkpoint_file = f"{self.checkpoint_dir}/{self.chain_id}_checkpoints.csv"
         
         if not os.path.exists(checkpoint_file):
             raise FileNotFoundError(f"Checkpoint data not found: {checkpoint_file}")
@@ -183,7 +194,7 @@ class AttestVerifier:
     
     def load_attestation_data(self) -> List[Dict[str, Any]]:
         """Load attestation calldata from attest_watcher"""
-        attestation_file = f"data/oracle/attestations.csv"  # note: may need to adjust for multi-chain
+        attestation_file = f"{self.oracle_dir}/attestations.csv"  # note: may need to adjust for multi-chain
         
         if not os.path.exists(attestation_file):
             raise FileNotFoundError(f"Attestation data not found: {attestation_file}")
@@ -214,7 +225,7 @@ class AttestVerifier:
         """
         Load validator set data by checkpoint from validator sets CSV
         """
-        valset_file = f"data/layer_checkpoints/{self.chain_id}_validator_sets.csv"
+        valset_file = f"{self.checkpoint_dir}/{self.chain_id}_validator_sets.csv"
         
         if not os.path.exists(valset_file):
             logger.warning(f"Validator set data not found: {valset_file}")
@@ -776,7 +787,7 @@ class AttestVerifier:
     def write_result(self, result: Dict[str, Any]):
         """Write validation result to CSV"""
         try:
-            with open(self.results_file, 'a', newline='') as f:
+            with open(self.validation_csv_file, 'a', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
                     result['validation_timestamp'],
@@ -877,7 +888,7 @@ class AttestVerifier:
         logger.info(f"  🔒 Invalid signatures: {invalid_signature_count}")
         logger.info(f"  ❌ Errors: {error_count}")
         logger.info(f"  📈 Total validations: {state['total_validations']}")
-        logger.info(f"Results saved to: {self.results_file}")
+        logger.info(f"Results saved to: {self.validation_csv_file}")
         logger.info(f"State saved to: {self.state_file}")
         
         if malicious_count > 0:

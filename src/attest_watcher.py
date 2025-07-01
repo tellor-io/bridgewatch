@@ -25,7 +25,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # import config
-from config import config
+from config import config, get_config_manager
 
 # configuration from config module
 WEB3_PROVIDER_URL = config.get_evm_rpc_url()
@@ -49,8 +49,15 @@ class AttestWatcher:
         self.bridge_address = Web3.to_checksum_address(bridge_address)
         self.output_prefix = output_prefix
         
+        # get config manager for directory paths
+        try:
+            config_manager = get_config_manager()
+            self.data_dir = config_manager.get_oracle_dir()
+        except RuntimeError:
+            # fallback to legacy paths if in legacy mode
+            self.data_dir = "data/oracle"
+        
         # create data directory structure
-        self.data_dir = "data/oracle"
         os.makedirs(self.data_dir, exist_ok=True)
         
         # output files in data directory

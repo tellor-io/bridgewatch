@@ -4,3 +4,4 @@ __pycache__/
 data/
 docs/
 data_backup/
+.DS_Store

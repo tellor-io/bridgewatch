@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # import config
-from config import config
+from config import config, get_config_manager
 
 # configuration from config module
 MAX_RETRIES = config.get_max_retries()
@@ -41,8 +41,15 @@ class CheckpointScribe:
         self.chain_id = chain_id
         self.output_prefix = output_prefix
         
+        # get config manager for directory paths
+        try:
+            config_manager = get_config_manager()
+            self.data_dir = config_manager.get_layer_checkpoints_dir()
+        except RuntimeError:
+            # fallback to legacy paths if in legacy mode
+            self.data_dir = f"data/layer_checkpoints"
+        
         # create data directory structure
-        self.data_dir = f"data/layer_checkpoints"
         os.makedirs(self.data_dir, exist_ok=True)
         
         # output files in data directory (include chain_id in filename)
