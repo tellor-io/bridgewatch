@@ -16,7 +16,6 @@ A "verifier" emphasizes analysis and truth-checking against Layer.
 import json
 import csv
 import time
-import argparse
 import requests
 from typing import List, Dict, Any, Optional, Tuple
 from web3 import Web3
@@ -608,27 +607,3 @@ class ValsetVerifier:
         logger.info(f"  📈 Total validations: {state['total_validations']}")
         logger.info(f"Results saved to: {self.results_file}")
         logger.info(f"State saved to: {self.state_file}")
-
-def main():
-    """Main function"""
-    parser = argparse.ArgumentParser(description="Validate validator set updates against Layer blockchain data")
-    parser.add_argument("--layer-rpc", default=DEFAULT_LAYER_RPC_URL, help="Layer RPC URL")
-    parser.add_argument("--evm-rpc", default=DEFAULT_EVM_RPC_URL, help="EVM RPC URL")
-    parser.add_argument("--chain-id", default="layertest-4", help="Layer chain ID")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
-    
-    args = parser.parse_args()
-    
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
-    try:
-        verifier = ValsetVerifier(args.layer_rpc, args.evm_rpc, args.chain_id)
-        verifier.validate_all_valset_updates()
-        
-    except Exception as e:
-        logger.error(f"Validation failed: {e}")
-        raise
-
-if __name__ == "__main__":
-    main() 

@@ -9,7 +9,6 @@ using Layer's REST API endpoints. A "scribe" records the truth from Layer.
 import json
 import csv
 import time
-import argparse
 import requests
 from typing import List, Dict, Any, Optional
 import logging
@@ -593,39 +592,3 @@ class CheckpointScribe:
         except Exception as e:
             logger.error(f"Fatal error in continuous monitoring: {e}")
             raise
-
-def main():
-    """
-    Main function
-    """
-    parser = argparse.ArgumentParser(description="Monitor validator checkpoints and validator sets from Layer blockchain")
-    parser.add_argument("--layer-rpc", default=DEFAULT_LAYER_RPC_URL, help="Layer RPC URL")
-    parser.add_argument("--chain-id", default="layertest-4", help="Layer chain ID")
-    parser.add_argument("--output", default="checkpoints", help="Output file prefix")
-    parser.add_argument("--interval", type=int, default=300, help="Monitoring interval in seconds (default: 300 = 5 minutes)")
-    parser.add_argument("--once", action="store_true", help="Run once instead of continuously")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
-    
-    args = parser.parse_args()
-    
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
-    try:
-        scribe = CheckpointScribe(args.layer_rpc, args.chain_id, args.output)
-        
-        if args.once:
-            # run once
-            state = scribe.run_monitoring_cycle()
-            print(f"Scan complete. Found {state['total_checkpoints_found']} total checkpoints.")
-            print(f"Results saved to: {scribe.csv_file}")
-        else:
-            # run continuously
-            scribe.run_continuous(args.interval)
-            
-    except Exception as e:
-        logger.error(f"Script failed: {e}")
-        raise
-
-if __name__ == "__main__":
-    main() 

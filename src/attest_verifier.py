@@ -15,7 +15,6 @@ A "verifier" emphasizes analysis and truth-checking against Layer.
 import json
 import csv
 import time
-import argparse
 import requests
 from typing import List, Dict, Any, Optional, Tuple
 from web3 import Web3
@@ -885,48 +884,3 @@ class AttestVerifier:
             logger.warning(f"🚨 {malicious_count} malicious attestations detected from valid validators!")
         if invalid_signature_count > 0:
             logger.info(f"🔒 {invalid_signature_count} attestations filtered out (invalid validator signatures)")
-
-def main():
-    """Main function"""
-    parser = argparse.ArgumentParser(description="Validate attestations against Layer blockchain data with validator signature verification")
-    parser.add_argument("--layer-rpc", default=DEFAULT_LAYER_RPC_URL, help="Layer RPC URL")
-    parser.add_argument("--chain-id", default="layertest-4", help="Layer chain ID")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
-    parser.add_argument("--test-discord", action="store_true", help="Test Discord webhook")
-    
-    args = parser.parse_args()
-    
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
-    try:
-        verifier = AttestVerifier(args.layer_rpc, args.chain_id)
-        
-        if args.test_discord:
-            # test Discord webhook
-            test_data = {
-                'tx_hash': '0x1234567890abcdef...',
-                'block_number': 12345
-            }
-            test_result = {
-                'query_id': '0xabcdef...',
-                'snapshot': '0x1234567890abcdef1234567890abcdef...',
-                'signature_verification': {
-                    'verified_signatures': [{'address': '0x1234...', 'power': 1000}],
-                    'signing_percentage': 25.5,
-                    'total_signing_power': 1000,
-                    'total_validator_power': 4000
-                }
-            }
-            logger.info("Testing Discord webhook...")
-            verifier.send_discord_alert('malicious_attestation', test_data, test_result)
-            logger.info("Discord test complete")
-        else:
-            verifier.validate_all_attestations()
-        
-    except Exception as e:
-        logger.error(f"Validation failed: {e}")
-        raise
-
-if __name__ == "__main__":
-    main() 

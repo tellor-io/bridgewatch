@@ -9,7 +9,6 @@ using the eth_getLogs RPC method. A "watcher" observes changes on EVM.
 import json
 import csv
 import time
-import argparse
 from typing import List, Dict, Any, Optional
 from web3 import Web3
 try:
@@ -532,40 +531,3 @@ class ValsetWatcher:
         except Exception as e:
             logger.error(f"Fatal error in continuous monitoring: {e}")
             raise
-
-def main():
-    """
-    Main function
-    """
-    parser = argparse.ArgumentParser(description="Monitor ValidatorSetUpdated events from bridge contract")
-    parser.add_argument("--provider", default=WEB3_PROVIDER_URL, help="Web3 provider URL")
-    parser.add_argument("--bridge", default=BRIDGE_CONTRACT_ADDRESS, help="Bridge contract address")
-    parser.add_argument("--output", default="valset_updates", help="Output file prefix")
-    parser.add_argument("--interval", type=int, default=300, help="Monitoring interval in seconds (default: 300 = 5 minutes)")
-    parser.add_argument("--buffer", type=int, default=5, help="Block buffer to avoid indexing issues (default: 5)")
-    parser.add_argument("--once", action="store_true", help="Run once instead of continuously")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
-    
-    args = parser.parse_args()
-    
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
-    try:
-        watcher = ValsetWatcher(args.provider, args.bridge, args.output)
-        
-        if args.once:
-            # run once
-            state = watcher.run_monitoring_cycle(args.buffer)
-            print(f"Scan complete. Found {state['total_events_found']} total events.")
-            print(f"Results saved to: {watcher.csv_file}")
-        else:
-            # run continuously
-            watcher.run_continuous(args.interval, args.buffer)
-            
-    except Exception as e:
-        logger.error(f"Script failed: {e}")
-        raise
-
-if __name__ == "__main__":
-    main() 

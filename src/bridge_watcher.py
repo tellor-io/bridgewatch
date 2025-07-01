@@ -330,6 +330,7 @@ Examples:
   bridgewatch --verbose start        # verbose flag works globally too
   bridgewatch status --no-color      # show status without colors
   bridgewatch reset                  # reset all progress
+  bridgewatch test-discord           # test Discord webhook alerts
         """
     )
     
@@ -355,6 +356,11 @@ Examples:
     reset_parser = subparsers.add_parser('reset', help='Reset all state files')
     reset_parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     reset_parser.add_argument('--no-color', action='store_true', help='Disable colored output')
+    
+    # test-discord command
+    discord_parser = subparsers.add_parser('test-discord', help='Test Discord webhook')
+    discord_parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
+    discord_parser.add_argument('--no-color', action='store_true', help='Disable colored output')
     
     args = parser.parse_args()
     
@@ -387,6 +393,45 @@ Examples:
         elif args.command == 'reset':
             watcher = BridgeWatcher()
             watcher.reset()
+            
+        elif args.command == 'test-discord':
+            # test Discord webhook directly without full initialization
+            logger.info("🧪 Testing Discord webhook...")
+            
+            discord_webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
+            if not discord_webhook_url:
+                logger.error("❌ DISCORD_WEBHOOK_URL environment variable not set")
+                logger.info("💡 Set DISCORD_WEBHOOK_URL in your .env file or environment")
+                sys.exit(1)
+            
+            # create test data
+            test_attestation = {
+                'tx_hash': '0x1234567890abcdef1234567890abcdef12345678',
+                'block_number': 12345
+            }
+            test_result = {
+                'query_id': '0xabcdef1234567890abcdef1234567890abcdef12',
+                'snapshot': '0x1234567890abcdef1234567890abcdef12345678',
+                'signature_verification': {
+                    'verified_signatures': [
+                        {'address': '0x1234567890abcdef12345678', 'power': 1000},
+                        {'address': '0xabcdef1234567890abcdef12', 'power': 750}
+                    ],
+                    'signing_percentage': 100.0,
+                    'total_signing_power': 1750,
+                    'total_validator_power': 4970
+                }
+            }
+            
+            # test the alert function
+            try:
+                watcher = BridgeWatcher()
+                watcher.attest_verifier.send_discord_alert('malicious_attestation', test_attestation, test_result)
+                logger.info("✅ Discord test message sent successfully!")
+                logger.info("💡 Check your Discord channel for the test alert")
+            except Exception as e:
+                logger.error(f"❌ Discord test failed: {e}")
+                sys.exit(1)
             
     except Exception as e:
         logger.error(f"Fatal error: {e}")
