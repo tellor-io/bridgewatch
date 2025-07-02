@@ -43,10 +43,11 @@ INITIAL_BACKOFF = 5  # initial backoff delay in seconds
 MAX_BACKOFF_ATTEMPTS = 5  # number of exponential backoff attempts
 
 class ValsetWatcher:
-    def __init__(self, provider_url: str, bridge_address: str, output_prefix: str = "valset_updates"):
+    def __init__(self, provider_url: str, bridge_address: str, output_prefix: str = "valset_updates", min_height: Optional[int] = None):
         self.w3 = Web3(Web3.HTTPProvider(provider_url))
         self.bridge_address = Web3.to_checksum_address(bridge_address)
         self.output_prefix = output_prefix
+        self.min_height = min_height
         
         # get config manager for directory paths
         try:
@@ -145,20 +146,40 @@ class ValsetWatcher:
         if os.path.exists(self.state_file):
             try:
                 with open(self.state_file, 'r') as f:
-                    return json.load(f)
+                    state = json.load(f)
+                    
+                    # if min_height is specified and higher than saved state, use min_height
+                    if self.min_height is not None:
+                        saved_block = state.get("last_processed_block", 0)
+                        if self.min_height > saved_block:
+                            logger.info(f"Using --min-height {self.min_height} instead of saved state block {saved_block}")
+                            return {
+                                "last_processed_block": self.min_height - 1,  # subtract 1 so we start from min_height
+                                "total_events_found": 0
+                            }
+                    
+                    return state
             except Exception as e:
                 logger.warning(f"Could not load state file: {e}")
         
-        # default state - start from 21 days ago
-        logger.info("No previous state found, starting from 21 days ago")
+        # determine starting block for new state
+        start_block = None
         
-        # calculate timestamp for 21 days ago
-        import time as time_module
-        days_ago_21 = 21 * 24 * 60 * 60  # 21 days in seconds
-        target_timestamp = int(time_module.time()) - days_ago_21
-        
-        # find the block from 21 days ago
-        start_block = self.find_block_by_timestamp(target_timestamp)
+        if self.min_height is not None:
+            # use min_height if specified
+            start_block = self.min_height
+            logger.info(f"No previous state found, starting from --min-height {self.min_height}")
+        else:
+            # default state - start from 21 days ago
+            logger.info("No previous state found, starting from 21 days ago")
+            
+            # calculate timestamp for 21 days ago
+            import time as time_module
+            days_ago_21 = 21 * 24 * 60 * 60  # 21 days in seconds
+            target_timestamp = int(time_module.time()) - days_ago_21
+            
+            # find the block from 21 days ago
+            start_block = self.find_block_by_timestamp(target_timestamp)
         
         return {
             "last_processed_block": start_block - 1,  # subtract 1 so we start from start_block
@@ -245,13 +266,15 @@ class ValsetWatcher:
         
         # handle transaction hash (might be bytes or string)
         tx_hash = log.get("transactionHash", "")
-        if isinstance(tx_hash, bytes):
+        
+        # check HexBytes first (before bytes, since HexBytes inherits from bytes)
+        if hasattr(tx_hash, 'hex'):  # HexBytes from web3.py
+            tx_hash = tx_hash.hex()  # already returns string with 0x prefix
+        elif isinstance(tx_hash, bytes):
             tx_hash = "0x" + tx_hash.hex()
-        elif hasattr(tx_hash, 'hex'):  # HexBytes
-            tx_hash = tx_hash.hex()
         elif isinstance(tx_hash, str) and not tx_hash.startswith("0x"):
             tx_hash = "0x" + tx_hash
-        
+                
         try:
             # decode uint256 powerThreshold (first 32 bytes)
             power_threshold = int(data[0:64], 16)

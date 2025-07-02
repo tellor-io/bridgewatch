@@ -37,8 +37,9 @@ from attest_verifier import AttestVerifier
 from config import config, get_config_manager
 
 class BridgeWatcher:
-    def __init__(self):
+    def __init__(self, min_height: Optional[int] = None):
         self.running = False
+        self.min_height = min_height
         
         # get config manager for directory paths
         try:
@@ -63,13 +64,15 @@ class BridgeWatcher:
         self.valset_watcher = ValsetWatcher(
             provider_url=config.get_evm_rpc_url(),
             bridge_address=config.get_bridge_address(),
-            output_prefix='valset_updates'
+            output_prefix='valset_updates',
+            min_height=min_height
         )
         
         self.attest_watcher = AttestWatcher(
             provider_url=config.get_evm_rpc_url(),
             bridge_address=config.get_bridge_address(),
-            output_prefix='attestations'
+            output_prefix='attestations',
+            min_height=min_height
         )
         
         self.valset_verifier = ValsetVerifier(
@@ -193,6 +196,11 @@ class BridgeWatcher:
         logger.info(f"📍 EVM RPC: {config.get_evm_rpc_url()}")
         logger.info(f"📍 Bridge Address: {config.get_bridge_address()}")
         logger.info(f"📍 Chain ID: {config.get_chain_id()}")
+        
+        if self.min_height is not None:
+            logger.info(f"⬆️  Min Height: {self.min_height} (will override saved state if higher)")
+        else:
+            logger.info("⬆️  Min Height: Not set (using saved state or 21 days ago)")
         
         self.running = True
         state = self.load_watcher_state()
@@ -375,8 +383,9 @@ def main():
 Examples:
   bridgewatch start                  # start continuous monitoring  
   bridgewatch start --once           # run once and exit
-  bridgewatch start --interval 600   # run every 10 minutes
-  bridgewatch start --verbose        # start with verbose colored logging
+  bridgewatch start --interval 600         # run every 10 minutes
+  bridgewatch start --min-height 8500000   # start scraping from block 8500000
+  bridgewatch start --verbose              # start with verbose colored logging
   bridgewatch --verbose start        # verbose flag works globally too
   bridgewatch status --no-color      # show status without colors
   bridgewatch reset                  # reset all progress
@@ -398,6 +407,7 @@ Examples:
     start_parser = subparsers.add_parser('start', help='Start bridge monitoring')
     start_parser.add_argument('--once', action='store_true', help='Run once instead of continuously')
     start_parser.add_argument('--interval', type=int, default=300, help='Monitoring interval in seconds (default: 300)')
+    start_parser.add_argument('--min-height', type=int, help='Minimum block height to start scraping from (EVM chains)')
     start_parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     start_parser.add_argument('--no-color', action='store_true', help='Disable colored output')
     
@@ -455,7 +465,7 @@ Examples:
     
     try:
         if args.command == 'start':
-            watcher = BridgeWatcher()
+            watcher = BridgeWatcher(min_height=args.min_height)
             if args.once:
                 watcher.run_once()
             else:

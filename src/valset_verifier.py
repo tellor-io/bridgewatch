@@ -23,6 +23,9 @@ from eth_abi import decode
 import logging
 from datetime import datetime
 import os
+import hashlib
+from eth_utils import decode_hex
+from eth_keys import keys
 
 # configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -55,11 +58,15 @@ class ValsetVerifier:
             self.data_dir = config_manager.get_validation_dir()
             self.checkpoint_dir = config_manager.get_layer_checkpoints_dir()
             self.valset_dir = config_manager.get_valset_dir()
+            
+            # get Discord webhook URL from config
+            self.discord_webhook_url = config_manager.get_discord_webhook_url()
         except RuntimeError:
             # fallback to legacy paths if in legacy mode
             self.data_dir = f"data/validation"
             self.checkpoint_dir = f"data/layer_checkpoints"
             self.valset_dir = f"data/valset"
+            self.discord_webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
         
         # create data directory
         os.makedirs(self.data_dir, exist_ok=True)
@@ -106,7 +113,11 @@ class ValsetVerifier:
                     'hash_match',
                     'status',
                     'error_details',
-                    'evidence_generated'
+                    'evidence_generated',
+                    'is_valid_validator_signature',
+                    'signing_validator_count',
+                    'signing_power_percentage',
+                    'malicious_checkpoint_signed'
                 ])
 
     def load_validation_state(self) -> Dict[str, Any]:
@@ -218,6 +229,7 @@ class ValsetVerifier:
     def query_layer_checkpoint_params(self, timestamp: int) -> Optional[Dict[str, Any]]:
         """
         Query Layer to get validator checkpoint params for a specific timestamp
+        Returns None if no checkpoint exists (indicates malicious data was signed)
         """
         try:
             url = f"{self.layer_rpc_url}/layer/bridge/get_validator_checkpoint_params/{timestamp}"
@@ -229,6 +241,17 @@ class ValsetVerifier:
                 return data
             elif response.status_code == 404:
                 logger.debug(f"No Layer checkpoint found for timestamp {timestamp}")
+                return None
+            elif response.status_code == 500:
+                # check if this is the specific "failed to get validator checkpoint params" error
+                try:
+                    error_data = response.json()
+                    if error_data.get('code') == 13 and 'failed to get validator checkpoint params' in error_data.get('message', ''):
+                        logger.warning(f"Layer confirms no checkpoint exists for timestamp {timestamp} - potential malicious signature")
+                        return None
+                except:
+                    pass
+                logger.warning(f"Layer API error for timestamp {timestamp}: {response.status_code}")
                 return None
             else:
                 logger.warning(f"Layer API error for timestamp {timestamp}: {response.status_code}")
@@ -266,29 +289,31 @@ class ValsetVerifier:
             logger.debug(f"Tracing transaction {tx_hash} for evidence extraction")
             
             # get transaction trace
-            trace_result = self.w3.manager.request_blocking("debug_traceTransaction", [tx_hash, {"tracer": "callTracer"}])
+            trace_result = self.w3.manager.request_blocking("trace_transaction", [tx_hash])
             
-            # look for updateValidatorSet call in the trace
-            def find_update_validator_set_call(call_trace):
-                if call_trace.get("type") == "CALL":
-                    input_data = call_trace.get("input", "")
-                    if input_data.startswith(UPDATE_VALIDATOR_SET_SELECTOR):
-                        return call_trace
-                
-                # recursively check calls
-                for call in call_trace.get("calls", []):
-                    result = find_update_validator_set_call(call)
-                    if result:
-                        return result
+            # trace_transaction returns a list of trace objects
+            if not isinstance(trace_result, list):
+                logger.error(f"Unexpected trace result format for {tx_hash}: {type(trace_result)}")
                 return None
             
-            update_call = find_update_validator_set_call(trace_result)
+            # look for updateValidatorSet call in the trace list
+            def find_update_validator_set_call_in_traces(traces):
+                for trace in traces:
+                    if trace.get("type") == "call":
+                        action = trace.get("action", {})
+                        input_data = action.get("input", "")
+                        if input_data.startswith(UPDATE_VALIDATOR_SET_SELECTOR):
+                            return trace
+                return None
+            
+            update_call = find_update_validator_set_call_in_traces(trace_result)
             if not update_call:
                 logger.warning(f"No updateValidatorSet call found in transaction {tx_hash}")
                 return None
             
             # decode the input data
-            input_data = update_call["input"]
+            action = update_call.get("action", {})
+            input_data = action.get("input", "")
             decoded_params = self.decode_update_validator_set_calldata(input_data)
             
             if decoded_params:
@@ -429,7 +454,11 @@ class ValsetVerifier:
             'hash_match': False,
             'status': 'FAILED',
             'error_details': '',
-            'evidence_generated': False
+            'evidence_generated': False,
+            'is_valid_validator_signature': False,
+            'signing_validator_count': 0,
+            'signing_power_percentage': 0,
+            'malicious_checkpoint_signed': False
         }
         
         try:
@@ -439,22 +468,74 @@ class ValsetVerifier:
             layer_params = self.query_layer_checkpoint_params(valset_update['validator_timestamp'])
             
             if not layer_params:
-                # try to find closest checkpoint in our local data
-                closest_checkpoint = self.find_closest_checkpoint(valset_update['validator_timestamp'], checkpoints)
-                if closest_checkpoint:
-                    result['layer_power_threshold'] = closest_checkpoint['power_threshold']
-                    result['layer_validator_timestamp'] = closest_checkpoint['timestamp']
-                    result['layer_validator_set_hash'] = closest_checkpoint['validator_set_hash']
+                # CRITICAL: No checkpoint exists for this timestamp on Layer blockchain
+                # This means validators signed a non-existent checkpoint → MALICIOUS BEHAVIOR
+                logger.warning(f"🚨 NO LAYER CHECKPOINT EXISTS for timestamp {valset_update['validator_timestamp']} - MALICIOUS SIGNATURE DETECTED")
+                
+                # trace transaction to extract signature parameters
+                valset_params = self.trace_transaction_for_evidence(valset_update['tx_hash'])
+                if not valset_params:
+                    result['error_details'] = 'No Layer checkpoint exists but failed to extract transaction data for signature verification'
+                    result['status'] = 'MALICIOUS_NO_SIGNATURE_DATA'
+                    result['malicious_checkpoint_signed'] = True
+                    return result
+                
+                # find the latest real checkpoint before this malicious timestamp for validator set lookup
+                latest_checkpoint = self.find_latest_checkpoint_before(valset_update['validator_timestamp'], checkpoints)
+                if not latest_checkpoint:
+                    result['error_details'] = 'No Layer checkpoint exists and no previous checkpoint found for validator lookup'
+                    result['status'] = 'MALICIOUS_NO_VALIDATOR_DATA'
+                    result['malicious_checkpoint_signed'] = True
+                    return result
+                
+                # load validator set from latest checkpoint before malicious timestamp
+                validator_set = self.load_validator_set_by_checkpoint(latest_checkpoint['checkpoint'])
+                if not validator_set:
+                    result['error_details'] = f'No Layer checkpoint exists and failed to load validator set for checkpoint {latest_checkpoint["checkpoint"]}'
+                    result['status'] = 'MALICIOUS_NO_VALIDATOR_DATA'
+                    result['malicious_checkpoint_signed'] = True
+                    return result
+                
+                # verify signatures against real validators
+                signature_verification = self.verify_valset_signatures_against_validators(valset_params, validator_set)
+                
+                if signature_verification['is_valid_validator']:
+                    # signatures came from real validators → CONFIRMED MALICIOUS BEHAVIOR
+                    result['status'] = 'MALICIOUS_CHECKPOINT_SIGNED'
+                    result['error_details'] = f'Validators signed non-existent checkpoint (timestamp: {valset_update["validator_timestamp"]})'
+                    result['is_valid_validator_signature'] = True
+                    result['signing_validator_count'] = len(signature_verification['verified_signatures'])
+                    result['signing_power_percentage'] = signature_verification['signing_percentage']
+                    result['malicious_checkpoint_signed'] = True
                     
-                    # check if timestamps are close enough (within 1 minute = 60000ms)
-                    time_diff = abs(closest_checkpoint['timestamp'] - valset_update['validator_timestamp'])
-                    if time_diff > 60000:
-                        result['error_details'] = f'No exact Layer checkpoint, closest is {time_diff}ms away'
-                        result['status'] = 'NO_LAYER_DATA'
-                        return result
+                    # send Discord alert for malicious behavior
+                    self.send_discord_alert("malicious_valset_signature", {
+                        'tx_hash': valset_update['tx_hash'],
+                        'block_number': valset_update['block_number'],
+                        'validator_timestamp': valset_update['validator_timestamp'],
+                        'signing_validator_count': len(signature_verification['verified_signatures']),
+                        'signing_power_percentage': signature_verification['signing_percentage'],
+                        'verified_signatures': signature_verification['verified_signatures']
+                    })
+                    
+                    logger.error(f"🚨 CONFIRMED MALICIOUS BEHAVIOR: {len(signature_verification['verified_signatures'])} validators signed non-existent checkpoint")
+                    logger.error(f"   Malicious validators: {[sig['address'] for sig in signature_verification['verified_signatures']]}")
+                    logger.error(f"   Total malicious power: {signature_verification['signing_percentage']:.2f}%")
+                    
+                    # generate evidence for malicious signatures
+                    evidence_command = self.generate_evidence_command(valset_update['tx_hash'], valset_params, result)
+                    self.write_evidence_command(evidence_command)
+                    result['evidence_generated'] = True
+                    
+                    return result
                 else:
-                    result['error_details'] = 'No Layer checkpoint data found'
-                    result['status'] = 'NO_LAYER_DATA'
+                    # signatures not from validators → might be spam or invalid
+                    result['status'] = 'INVALID_SIGNATURES'
+                    result['error_details'] = 'No Layer checkpoint exists and signatures not from valid validators (likely spam)'
+                    result['is_valid_validator_signature'] = False
+                    result['signing_validator_count'] = 0
+                    result['signing_power_percentage'] = 0
+                    result['malicious_checkpoint_signed'] = False
                     return result
             else:
                 # extract layer params from API response and normalize format
@@ -504,6 +585,8 @@ class ValsetVerifier:
                 result['status'] = 'TIMESTAMP_MISMATCH'
                 result['error_details'] = f"timestamp: EVM={result['evm_validator_timestamp']} vs Layer={result['layer_validator_timestamp']}"
             
+
+            
         except Exception as e:
             result['error_details'] = str(e)
             logger.error(f"Error validating valset update {valset_update['tx_hash']}: {e}")
@@ -530,7 +613,11 @@ class ValsetVerifier:
                     result['hash_match'],
                     result['status'],
                     result['error_details'],
-                    result['evidence_generated']
+                    result['evidence_generated'],
+                    result['is_valid_validator_signature'],
+                    result['signing_validator_count'],
+                    result['signing_power_percentage'],
+                    result['malicious_checkpoint_signed']
                 ])
                 f.flush()
         except Exception as e:
@@ -569,8 +656,10 @@ class ValsetVerifier:
         # validate each valset update
         valid_count = 0
         malicious_count = 0
+        malicious_checkpoint_count = 0
         timestamp_mismatch_count = 0
         no_data_count = 0
+        invalid_signature_count = 0
         error_count = 0
         processed_count = 0
         
@@ -587,11 +676,18 @@ class ValsetVerifier:
                 malicious_count += 1
                 logger.warning(f"🚨 MALICIOUS VALIDATOR SET UPDATE DETECTED: {valset_update['tx_hash']}")
                 logger.warning(f"   Details: {result['error_details']}")
+            elif result['status'] == 'MALICIOUS_CHECKPOINT_SIGNED':
+                malicious_checkpoint_count += 1
+                logger.error(f"🚨 MALICIOUS CHECKPOINT SIGNATURE DETECTED: {valset_update['tx_hash']}")
+                logger.error(f"   Details: {result['error_details']}")
             elif result['status'] == 'TIMESTAMP_MISMATCH':
                 timestamp_mismatch_count += 1
                 logger.info(f"⚠️  Timestamp mismatch: {valset_update['tx_hash']}")
             elif result['status'] == 'NO_LAYER_DATA':
                 no_data_count += 1
+            elif result['status'] == 'INVALID_SIGNATURES':
+                invalid_signature_count += 1
+                logger.info(f"ℹ️  Invalid signatures (not from validators): {valset_update['tx_hash']}")
             else:
                 error_count += 1
             
@@ -611,10 +707,249 @@ class ValsetVerifier:
         logger.info(f"Validator set validation complete:")
         logger.info(f"  📊 Processed: {processed_count} new updates")
         logger.info(f"  ✅ Valid: {valid_count}")
-        logger.info(f"  🚨 Malicious: {malicious_count}")
+        logger.info(f"  🚨 Malicious (param mismatch): {malicious_count}")
+        logger.info(f"  🔥 Malicious (non-existent checkpoint): {malicious_checkpoint_count}")
         logger.info(f"  ⚠️  Timestamp mismatches: {timestamp_mismatch_count}")
+        logger.info(f"  📧 Invalid signatures (spam): {invalid_signature_count}")
         logger.info(f"  📭 No Layer data: {no_data_count}")
         logger.info(f"  ❌ Errors: {error_count}")
         logger.info(f"  📈 Total validations: {state['total_validations']}")
+        
+        total_malicious = malicious_count + malicious_checkpoint_count
+        if total_malicious > 0:
+            logger.warning(f"⚠️  {total_malicious} MALICIOUS VALIDATOR SET UPDATES DETECTED - check evidence file")
+            logger.warning(f"   Evidence file: {self.evidence_file}")
+            
+            if malicious_checkpoint_count > 0:
+                logger.error(f"🔥 CRITICAL: {malicious_checkpoint_count} validators signed NON-EXISTENT checkpoints!")
+        
         logger.info(f"Results saved to: {self.validation_csv_file}")
         logger.info(f"State saved to: {self.state_file}")
+
+    def find_latest_checkpoint_before(self, target_timestamp: int, checkpoints: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """
+        Find the latest checkpoint with timestamp before the target timestamp
+        This is used for validator set lookup when detecting malicious signatures
+        """
+        latest_checkpoint = None
+        
+        for checkpoint in checkpoints:
+            if checkpoint['timestamp'] < target_timestamp:
+                if not latest_checkpoint or checkpoint['timestamp'] > latest_checkpoint['timestamp']:
+                    latest_checkpoint = checkpoint
+        
+        if latest_checkpoint:
+            logger.debug(f"Found latest checkpoint before {target_timestamp}: index {latest_checkpoint['index']}, "
+                        f"timestamp {latest_checkpoint['timestamp']}")
+        
+        return latest_checkpoint
+
+    def load_validator_set_by_checkpoint(self, checkpoint: str) -> Optional[List[Dict[str, Any]]]:
+        """
+        Load validator set data by checkpoint from validator sets CSV
+        """
+        valset_file = f"{self.checkpoint_dir}/{self.chain_id}_validator_sets.csv"
+        
+        if not os.path.exists(valset_file):
+            logger.warning(f"Validator set data not found: {valset_file}")
+            return None
+        
+        validator_set = []
+        try:
+            with open(valset_file, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row['valset_checkpoint'] == checkpoint:
+                        validator_set.append({
+                            'ethereumAddress': row['ethereum_address'],
+                            'power': int(row['power']),
+                            'scrape_timestamp': row['scrape_timestamp'],
+                            'valset_timestamp': row['valset_timestamp']
+                        })
+            
+            if validator_set:
+                logger.debug(f"Loaded validator set for checkpoint {checkpoint}: {len(validator_set)} validators")
+                return validator_set
+            else:
+                logger.warning(f"No validator set found for checkpoint {checkpoint}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error loading validator set for checkpoint {checkpoint}: {e}")
+            return None
+
+    def ecrecover_signature_with_validator_check(self, message_hash: bytes, signature: Dict[str, Any], 
+                                                validator_addresses: set) -> Optional[str]:
+        """
+        Recover Ethereum address from signature and message hash, trying both v values (27 and 28)
+        Returns the address only if it matches a validator in the set
+        """
+        try:
+            # extract signature components
+            r = signature.get('r', '0x0')
+            s = signature.get('s', '0x0')
+            
+            # skip empty signatures
+            if r == '0x0000000000000000000000000000000000000000000000000000000000000000':
+                return None
+            
+            # convert r and s to bytes
+            r_bytes = decode_hex(r)
+            s_bytes = decode_hex(s)
+            
+            # try both v values (27 and 28) since cosmos-sdk doesn't provide v
+            for v_recovery in [0, 1]:  # eth_keys uses 0,1 instead of 27,28
+                try:
+                    # create signature object
+                    signature_obj = keys.Signature(vrs=(
+                        v_recovery,
+                        int.from_bytes(r_bytes, byteorder='big'),
+                        int.from_bytes(s_bytes, byteorder='big')
+                    ))
+                    
+                    # recover public key from signature and message hash
+                    public_key = signature_obj.recover_public_key_from_msg_hash(message_hash)
+                    
+                    # get address from public key
+                    address = public_key.to_checksum_address()
+                    
+                    # check if this recovered address is in the validator set
+                    if address.lower() in validator_addresses:
+                        logger.debug(f"Valid signature recovered with v={v_recovery+27}: {address}")
+                        return address
+                    else:
+                        logger.debug(f"Recovered address {address} (v={v_recovery+27}) not in validator set, trying next v value")
+                    
+                except Exception as e:
+                    logger.debug(f"Failed to recover with v={v_recovery+27}: {e}")
+                    continue
+            
+            # no valid validator address found with either v value
+            logger.debug("No valid validator address recovered with either v=27 or v=28")
+            return None
+            
+        except Exception as e:
+            logger.debug(f"Error recovering signature: {e}")
+            return None
+
+    def verify_valset_signatures_against_validators(self, valset_params: Dict[str, Any], 
+                                                  validator_set: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Verify if any signature in the valset update was signed by a validator in the set
+        Uses checkpoint hash calculation for signature verification
+        """
+        try:
+            # calculate checkpoint hash for signature verification
+            # checkpoint = keccak256(abi.encode(timestamp, valsetHash, powerThreshold))
+            timestamp = valset_params['new_validator_timestamp']
+            valset_hash = valset_params['new_validator_set_hash']
+            power_threshold = valset_params['new_power_threshold']
+            
+            # encode for checkpoint hash
+            from eth_abi import encode
+            domain_separator = "0x636865636b706f696e7400000000000000000000000000000000000000000000"
+            encoded = encode(['bytes32', 'uint256', 'uint256', 'bytes32'], 
+                           [decode_hex(domain_separator), power_threshold, timestamp, decode_hex(valset_hash)])
+            checkpoint_hash = Web3.keccak(encoded)
+            
+            # sha256 hash the checkpoint as mentioned by user
+            message_hash = hashlib.sha256(checkpoint_hash).digest()
+            
+            # create validator address lookup
+            validator_addresses = {v['ethereumAddress'].lower() for v in validator_set}
+            total_validator_power = sum(v['power'] for v in validator_set)
+            
+            verified_signatures = []
+            total_signing_power = 0
+            
+            for i, signature in enumerate(valset_params['signatures']):
+                # try to recover signature with both v values and check against validator set
+                recovered_address = self.ecrecover_signature_with_validator_check(
+                    message_hash, signature, validator_addresses
+                )
+                
+                if recovered_address:
+                    # find the validator's power
+                    validator_power = next(
+                        (v['power'] for v in validator_set if v['ethereumAddress'].lower() == recovered_address.lower()),
+                        0
+                    )
+                    
+                    verified_signatures.append({
+                        'index': i,
+                        'address': recovered_address,
+                        'power': validator_power
+                    })
+                    total_signing_power += validator_power
+                    
+                    logger.debug(f"Valid signature from validator {recovered_address} with power {validator_power}")
+                else:
+                    logger.debug(f"Signature {i} not from valid validator (tried both v=27 and v=28)")
+            
+            is_valid = len(verified_signatures) > 0
+            
+            return {
+                'is_valid_validator': is_valid,
+                'verified_signatures': verified_signatures,
+                'total_signing_power': total_signing_power,
+                'total_validator_power': total_validator_power,
+                'signing_percentage': (total_signing_power / total_validator_power * 100) if total_validator_power > 0 else 0
+            }
+            
+        except Exception as e:
+            logger.error(f"Error verifying valset signatures against validators: {e}")
+            return {
+                'is_valid_validator': False,
+                'verified_signatures': [],
+                'total_signing_power': 0,
+                'total_validator_power': 0,
+                'signing_percentage': 0
+            }
+
+    def send_discord_alert(self, alert_type: str, details: Dict[str, Any]):
+        """Send Discord alert for malicious validator set signatures"""
+        if not self.discord_webhook_url:
+            logger.debug("No Discord webhook URL configured, skipping alert")
+            return
+        
+        try:
+            if alert_type == "malicious_valset_signature":
+                embed = {
+                    "title": "🚨 MALICIOUS VALIDATOR SET SIGNATURE DETECTED",
+                    "color": 16711680,  # red
+                    "fields": [
+                        {"name": "Transaction Hash", "value": f"`{details['tx_hash']}`", "inline": False},
+                        {"name": "Block Number", "value": str(details['block_number']), "inline": True},
+                        {"name": "Validator Timestamp", "value": str(details['validator_timestamp']), "inline": True},
+                        {"name": "Signing Validators", "value": str(details['signing_validator_count']), "inline": True},
+                        {"name": "Signing Power", "value": f"{details['signing_power_percentage']:.2f}%", "inline": True},
+                        {"name": "Issue", "value": "Validators signed non-existent checkpoint", "inline": False},
+                        {"name": "Validator Addresses", "value": "\n".join([f"`{sig['address']}` (power: {sig['power']})" 
+                                                                            for sig in details['verified_signatures'][:5]]), "inline": False}
+                    ],
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+            else:
+                return  # unknown alert type
+            
+            payload = {
+                "embeds": [embed]
+            }
+            
+            response = requests.post(self.discord_webhook_url, json=payload, timeout=10)
+            response.raise_for_status()
+            logger.info(f"Discord alert sent successfully for {alert_type}")
+            
+        except Exception as e:
+            logger.error(f"Failed to send Discord alert: {e}")
+
+def main():
+    verifier = ValsetVerifier(
+            layer_rpc_url=config.get_layer_rpc_url(),
+            evm_rpc_url=config.get_evm_rpc_url(),
+            chain_id=config.get_chain_id()
+    )
+    verifier.validate_all_valset_updates()
+
+if __name__ == "__main__":
+    main()
