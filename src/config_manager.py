@@ -140,7 +140,7 @@ class ConfigManager:
         # required fields
         required_fields = [
             'layer_chain', 'evm_chain', 'bridge_contract',
-            'layer_rpc_url', 'evm_rpc_url', 'data_dir'
+            'layer_rpc_url', 'evm_rpc_url', 'data_dir', 'database_path'
         ]
         
         for field in required_fields:
@@ -206,6 +206,31 @@ class ConfigManager:
     def get_display_name(self) -> str:
         """Get display name for active configuration"""
         return self._active_config.get('display_name', self._active_config_name)
+    
+    def get_database_path(self) -> str:
+        """Get database path for active configuration"""
+        return self._active_config.get('database_path', f"databases/{self._active_config_name}.duckdb")
+    
+    def create_database_manager(self):
+        """Create a database manager instance for the active configuration"""
+        from database_manager import BridgeMonitorDB
+        
+        db = BridgeMonitorDB(
+            config_name=self._active_config_name,
+            database_path=self.get_database_path()
+        )
+        
+        # store configuration metadata in the database
+        db.set_config_metadata(
+            display_name=self.get_display_name(),
+            layer_chain=self.get_layer_chain(),
+            evm_chain=self.get_evm_chain(),
+            bridge_contract=self.get_bridge_contract(),
+            layer_rpc_url=self.get_layer_rpc_url(),
+            evm_rpc_url=self.get_evm_rpc_url()
+        )
+        
+        return db
     
     # path helpers for data files
     

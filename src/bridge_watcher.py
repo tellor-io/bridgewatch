@@ -35,6 +35,7 @@ from attest_watcher import AttestWatcher
 from valset_verifier import ValsetVerifier
 from attest_verifier import AttestVerifier
 from config import config, get_config_manager
+from database_cli import DATABASE_COMMANDS
 
 class BridgeWatcher:
     def __init__(self, min_height: Optional[int] = None):
@@ -447,6 +448,20 @@ Examples:
     config_validate_parser = config_subparsers.add_parser('validate', help='Validate current configuration')
     config_validate_parser.add_argument('config_name', nargs='?', help='Configuration to validate (default: active config)')
     
+    # database command with subcommands
+    database_parser = subparsers.add_parser('database', help='Database management')
+    database_parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
+    database_parser.add_argument('--no-color', action='store_true', help='Disable colored output')
+    
+    database_subparsers = database_parser.add_subparsers(dest='database_command', help='Database commands')
+    
+    # add database subcommands dynamically
+    for cmd_name, cmd_info in DATABASE_COMMANDS.items():
+        db_cmd_parser = database_subparsers.add_parser(cmd_name, help=cmd_info['help'])
+        for arg_config in cmd_info['args']:
+            arg_names, arg_kwargs = arg_config
+            db_cmd_parser.add_argument(*arg_names, **arg_kwargs)
+    
     args = parser.parse_args()
     
     if args.command is None:
@@ -602,6 +617,20 @@ Examples:
                     logger.warning("⚠️ Configuration warnings:")
                     for warning in validation['warnings']:
                         print(f"  • {warning}")
+        
+        elif args.command == 'database':
+            # handle database commands
+            if not hasattr(args, 'database_command') or args.database_command is None:
+                logger.error("❌ No database subcommand specified")
+                logger.info("💡 Use 'bridgewatch database --help' for available commands")
+                sys.exit(1)
+            
+            db_command = args.database_command
+            if db_command in DATABASE_COMMANDS:
+                DATABASE_COMMANDS[db_command]['func'](args)
+            else:
+                logger.error(f"❌ Unknown database command: {db_command}")
+                sys.exit(1)
             
     except Exception as e:
         logger.error(f"Fatal error: {e}")
