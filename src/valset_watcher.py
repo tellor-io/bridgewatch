@@ -6,41 +6,33 @@ This component watches for ValidatorSetUpdated events from the data bridge contr
 using the eth_getLogs RPC method. A "watcher" observes changes on EVM.
 """
 
+import os
 import json
-import csv
 import time
-from typing import List, Dict, Any, Optional
+import logging
+from datetime import datetime
+from typing import Dict, Any, List, Optional
 from web3 import Web3
 try:
     from web3.middleware import geth_poa_middleware
 except ImportError:
     from web3.middleware.geth_poa import geth_poa_middleware
-import logging
-from datetime import datetime
-import os
+import csv
+from config_manager import get_config_manager
 
 # configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# import config
-from config import config, get_config_manager
-
 # ValidatorSetUpdated event signature
 # event ValidatorSetUpdated(uint256 _powerThreshold, uint256 _validatorTimestamp, bytes32 _validatorSetHash)
 VALIDATOR_SET_UPDATED_TOPIC = Web3.keccak(text="ValidatorSetUpdated(uint256,uint256,bytes32)").hex()
 
-# configuration from config module
-WEB3_PROVIDER_URL = config.get_evm_rpc_url()
-BRIDGE_CONTRACT_ADDRESS = config.get_bridge_address()
-MAX_RETRIES = config.get_max_retries()
-RETRY_DELAY = config.get_retry_delay()
-BLOCK_BATCH_SIZE = config.get_block_batch_size()
-CATCHUP_DELAY = config.get_catchup_delay()
-
-# Exponential backoff configuration for failed batches
-INITIAL_BACKOFF = 5  # initial backoff delay in seconds
-MAX_BACKOFF_ATTEMPTS = 5  # number of exponential backoff attempts
+# exponential backoff parameters
+INITIAL_DELAY = 1  # seconds
+MAX_DELAY = 60     # max seconds to wait
+BACKOFF_MULTIPLIER = 2
+MAX_RETRIES = 6    # number of exponential backoff attempts
 
 class ValsetWatcher:
     def __init__(self, provider_url: str, bridge_address: str, output_prefix: str = "valset_updates", min_height: Optional[int] = None):
@@ -49,20 +41,19 @@ class ValsetWatcher:
         self.output_prefix = output_prefix
         self.min_height = min_height
         
-        # get config manager for directory paths
+        # get config manager and database
         try:
-            config_manager = get_config_manager()
-            self.data_dir = config_manager.get_valset_dir()
+            self.config_manager = get_config_manager()
+            self.db = self.config_manager.create_database_manager()
+            self.data_dir = self.config_manager.get_valset_dir()
         except RuntimeError:
-            # fallback to legacy paths if in legacy mode
-            self.data_dir = "data/valset"
+            # fallback to legacy mode - this shouldn't happen in database mode
+            raise RuntimeError("Database mode requires configuration manager")
         
-        # create data directory structure
+        # create data directory structure (for failure logs)
         os.makedirs(self.data_dir, exist_ok=True)
         
-        # output files in data directory
-        self.state_file = f"{self.data_dir}/{output_prefix}_state.json"
-        self.csv_file = f"{self.data_dir}/{output_prefix}.csv"
+        # keep failure log file for debugging
         self.failure_log_file = f"{self.data_dir}/{output_prefix}_failures.log"
         
         # add PoA middleware if needed
@@ -83,25 +74,10 @@ class ValsetWatcher:
             
         logger.info(f"Connected to Web3. Latest block: {self.w3.eth.block_number}")
         
-        # initialize CSV file with headers if it doesn't exist
-        self.init_csv_file()
+        # initialize database schema if needed
+        self.db.init_database()
     
-    def init_csv_file(self):
-        """
-        Initialize CSV file with headers if it doesn't exist
-        """
-        if not os.path.exists(self.csv_file):
-            with open(self.csv_file, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    'timestamp',
-                    'block_number',
-                    'tx_hash',
-                    'log_index',
-                    'power_threshold',
-                    'validator_timestamp',
-                    'validator_set_hash'
-                ])
+
     
     def find_block_by_timestamp(self, target_timestamp: int) -> int:
         """
@@ -141,60 +117,61 @@ class ValsetWatcher:
     
     def load_state(self) -> Dict[str, Any]:
         """
-        Load the last processed state from file
+        Load watcher state from database
         """
-        if os.path.exists(self.state_file):
-            try:
-                with open(self.state_file, 'r') as f:
-                    state = json.load(f)
+        try:
+            state = self.db.get_component_state('valset_watcher')
+            if state:
+                # if min_height is specified and higher than saved state, use min_height
+                if self.min_height is not None:
+                    saved_block = state.get("last_processed_block", 0)
+                    if self.min_height > saved_block:
+                        logger.info(f"Using --min-height {self.min_height} instead of saved state block {saved_block}")
+                        return {
+                            "last_processed_block": self.min_height - 1,  # subtract 1 so we start from min_height
+                            "total_events_found": 0
+                        }
+                
+                logger.info(f"Loaded state from database. Last processed block: {state.get('last_processed_block', 'unknown')}")
+                return state
+            else:
+                logger.info("No previous state found in database, starting fresh")
+                # determine starting block for new state
+                start_block = None
+                
+                if self.min_height is not None:
+                    # use min_height if specified
+                    start_block = self.min_height
+                    logger.info(f"No previous state found, starting from --min-height {self.min_height}")
+                else:
+                    # default state - start from 21 days ago
+                    logger.info("No previous state found, starting from 21 days ago")
                     
-                    # if min_height is specified and higher than saved state, use min_height
-                    if self.min_height is not None:
-                        saved_block = state.get("last_processed_block", 0)
-                        if self.min_height > saved_block:
-                            logger.info(f"Using --min-height {self.min_height} instead of saved state block {saved_block}")
-                            return {
-                                "last_processed_block": self.min_height - 1,  # subtract 1 so we start from min_height
-                                "total_events_found": 0
-                            }
+                    # calculate timestamp for 21 days ago
+                    import time as time_module
+                    days_ago_21 = 21 * 24 * 60 * 60  # 21 days in seconds
+                    target_timestamp = int(time_module.time()) - days_ago_21
                     
-                    return state
-            except Exception as e:
-                logger.warning(f"Could not load state file: {e}")
-        
-        # determine starting block for new state
-        start_block = None
-        
-        if self.min_height is not None:
-            # use min_height if specified
-            start_block = self.min_height
-            logger.info(f"No previous state found, starting from --min-height {self.min_height}")
-        else:
-            # default state - start from 21 days ago
-            logger.info("No previous state found, starting from 21 days ago")
-            
-            # calculate timestamp for 21 days ago
-            import time as time_module
-            days_ago_21 = 21 * 24 * 60 * 60  # 21 days in seconds
-            target_timestamp = int(time_module.time()) - days_ago_21
-            
-            # find the block from 21 days ago
-            start_block = self.find_block_by_timestamp(target_timestamp)
-        
-        return {
-            "last_processed_block": start_block - 1,  # subtract 1 so we start from start_block
-            "total_events_found": 0
-        }
+                    # find the block from 21 days ago
+                    start_block = self.find_block_by_timestamp(target_timestamp)
+                
+                return {
+                    "last_processed_block": start_block - 1,  # subtract 1 so we start from start_block
+                    "total_events_found": 0
+                }
+        except Exception as e:
+            logger.warning(f"Failed to load state from database: {e}")
+            return {}
     
     def save_state(self, state: Dict[str, Any]):
         """
-        Save the current state to file
+        Save watcher state to database
         """
         try:
-            with open(self.state_file, 'w') as f:
-                json.dump(state, f, indent=2)
+            self.db.save_component_state('valset_watcher', state)
+            logger.debug(f"Saved state to database: {state}")
         except Exception as e:
-            logger.error(f"Could not save state file: {e}")
+            logger.error(f"Failed to save state to database: {e}")
     
     def get_logs_with_retry(self, from_block: int, to_block: int, max_retries: int = MAX_RETRIES) -> List[Dict[str, Any]]:
         """
@@ -222,8 +199,8 @@ class ValsetWatcher:
                 # check if it's a temporary service issue
                 if "service temporarily unavailable" in error_msg.lower() or "timeout" in error_msg.lower():
                     if attempt < max_retries - 1:
-                        logger.info(f"Retrying in {RETRY_DELAY} seconds...")
-                        time.sleep(RETRY_DELAY)
+                        logger.info(f"Retrying in {INITIAL_DELAY * BACKOFF_MULTIPLIER ** attempt} seconds...")
+                        time.sleep(INITIAL_DELAY * BACKOFF_MULTIPLIER ** attempt)
                         continue
                 
                 # for the last attempt or non-retryable errors, log and re-raise
@@ -339,25 +316,7 @@ class ValsetWatcher:
         
         return events
     
-    def write_to_csv(self, event_data: Dict[str, Any]):
-        """
-        Write event data to CSV file
-        """
-        try:
-            with open(self.csv_file, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    event_data['timestamp'],
-                    event_data['block_number'],
-                    event_data['tx_hash'],
-                    event_data['log_index'],
-                    event_data['power_threshold'],
-                    event_data['validator_timestamp'],
-                    event_data['validator_set_hash']
-                ])
-                f.flush()
-        except Exception as e:
-            logger.error(f"Failed to write to CSV file: {e}")
+
     
     def log_failed_batch(self, from_block: int, to_block: int, error: str):
         """
@@ -384,10 +343,25 @@ class ValsetWatcher:
     
     def write_event_data(self, event_data: Dict[str, Any]):
         """
-        Write event data to CSV file
+        Write event data to database
         """
-        self.write_to_csv(event_data)
-        logger.info(f"Saved ValidatorSetUpdated event from tx {event_data['tx_hash']} (block {event_data['block_number']})")
+        try:
+            # prepare data for database insertion
+            data = {
+                'timestamp': datetime.fromisoformat(event_data['timestamp'].replace('Z', '+00:00')),
+                'block_number': event_data['block_number'],
+                'tx_hash': event_data['tx_hash'],
+                'log_index': event_data['log_index'],
+                'power_threshold': event_data['power_threshold'],
+                'validator_timestamp': event_data['validator_timestamp'],
+                'validator_set_hash': event_data['validator_set_hash']
+            }
+            
+            self.db.insert_evm_valset_update(data)
+            logger.info(f"Saved ValidatorSetUpdated event from tx {event_data['tx_hash']} (block {event_data['block_number']})")
+            
+        except Exception as e:
+            logger.error(f"Failed to write event data to database: {e}")
     
     def scan_block_batch_with_exponential_backoff(self, from_block: int, to_block: int, max_backoff: int = 600) -> int:
         """
@@ -418,10 +392,10 @@ class ValsetWatcher:
             logger.info("Starting exponential backoff attempts...")
             
             # if initial attempt fails, try exponential backoff with single attempts
-            backoff_delay = INITIAL_BACKOFF
+            backoff_delay = INITIAL_DELAY
             
-            for attempt in range(MAX_BACKOFF_ATTEMPTS):
-                logger.info(f"Exponential backoff attempt {attempt + 1}/{MAX_BACKOFF_ATTEMPTS}: waiting {min(backoff_delay, max_backoff)} seconds...")
+            for attempt in range(MAX_RETRIES):
+                logger.info(f"Exponential backoff attempt {attempt + 1}/{MAX_RETRIES}: waiting {min(backoff_delay, max_backoff)} seconds...")
                 time.sleep(min(backoff_delay, max_backoff))
                 
                 try:
@@ -447,13 +421,13 @@ class ValsetWatcher:
                     logger.warning(f"Exponential backoff attempt {attempt + 1} failed for blocks {from_block}-{to_block}: {error_msg}")
                     
                     # if this is the last attempt, log failure and raise
-                    if attempt == MAX_BACKOFF_ATTEMPTS - 1:
-                        logger.error(f"All {MAX_BACKOFF_ATTEMPTS} exponential backoff attempts failed for blocks {from_block}-{to_block}")
+                    if attempt == MAX_RETRIES - 1:
+                        logger.error(f"All {MAX_RETRIES} exponential backoff attempts failed for blocks {from_block}-{to_block}")
                         self.log_failed_batch(from_block, to_block, error_msg)
                         raise e
                     
                     # double the delay for next attempt
-                    backoff_delay *= 2
+                    backoff_delay *= BACKOFF_MULTIPLIER
         
         return 0
     
@@ -468,10 +442,10 @@ class ValsetWatcher:
         max_backoff = monitoring_interval * 2
         
         # determine if we're in catch-up mode
-        is_catchup = total_blocks > BLOCK_BATCH_SIZE
+        is_catchup = total_blocks > 10000 # Assuming a large batch size for catch-up
         
         if is_catchup:
-            logger.info(f"Catch-up mode: scanning {total_blocks} blocks in batches of {BLOCK_BATCH_SIZE}")
+            logger.info(f"Catch-up mode: scanning {total_blocks} blocks in batches of {10000}")
             logger.info(f"Max backoff delay: {max_backoff} seconds (2x monitoring interval)")
         
         # process blocks in batches
@@ -479,7 +453,7 @@ class ValsetWatcher:
         batch_count = 0
         
         while current_block <= to_block:
-            batch_end = min(current_block + BLOCK_BATCH_SIZE - 1, to_block)
+            batch_end = min(current_block + 10000 - 1, to_block) # Use a fixed batch size for catch-up
             
             batch_count += 1
             logger.info(f"Processing batch {batch_count}: blocks {current_block}-{batch_end}")
@@ -490,10 +464,11 @@ class ValsetWatcher:
                 
                 current_block = batch_end + 1
                 
+                catchup_delay = self.config_manager.get_catchup_delay()
                 # add delay between batches during catch-up to avoid rate limiting
                 if is_catchup and current_block <= to_block:
-                    logger.info(f"Catch-up delay: waiting {CATCHUP_DELAY} seconds before next batch...")
-                    time.sleep(CATCHUP_DELAY)
+                    logger.info(f"Catch-up delay: waiting {catchup_delay} seconds before next batch...")
+                    time.sleep(catchup_delay)
                     
             except Exception as e:
                 logger.error(f"Failed to process batch {current_block}-{batch_end} after all retries: {e}")
@@ -541,8 +516,8 @@ class ValsetWatcher:
         Run continuous monitoring with specified interval
         """
         logger.info(f"Starting continuous monitoring (interval: {interval_seconds}s, block_buffer: {block_buffer})")
-        logger.info(f"Output file: {self.csv_file}")
-        logger.info(f"State file: {self.state_file}")
+        logger.info(f"Output file: (database)")
+        logger.info(f"State file: (database)")
         logger.info(f"Failure log: {self.failure_log_file}")
         
         try:

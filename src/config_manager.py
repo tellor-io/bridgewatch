@@ -319,4 +319,19 @@ class ConfigManager:
         separators = self.get_contract_config().get('domain_separators', {})
         if separator_name not in separators:
             raise ValueError(f"Domain separator for '{separator_name}' not found in config")
-        return separators[separator_name] 
+        return separators[separator_name]
+
+
+# Global configuration manager instance
+_config_manager_instance = None
+
+def get_config_manager() -> ConfigManager:
+    """
+    Get the global configuration manager instance (singleton pattern)
+    """
+    global _config_manager_instance
+    
+    if _config_manager_instance is None:
+        _config_manager_instance = ConfigManager()
+    
+    return _config_manager_instance

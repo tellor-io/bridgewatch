@@ -52,7 +52,7 @@ class ValsetVerifier:
         if not self.w3.is_connected():
             raise ConnectionError("Failed to connect to EVM RPC")
         
-        # get config manager for directory paths
+        # get config manager for directory paths and database
         try:
             config_manager = get_config_manager()
             self.data_dir = config_manager.get_validation_dir()
@@ -61,12 +61,17 @@ class ValsetVerifier:
             
             # get Discord webhook URL from config
             self.discord_webhook_url = config_manager.get_discord_webhook_url()
+            
+            # initialize database connection
+            self.db = config_manager.create_database_manager()
+            self.db.init_database()
         except RuntimeError:
             # fallback to legacy paths if in legacy mode
             self.data_dir = f"data/validation"
             self.checkpoint_dir = f"data/layer_checkpoints"
             self.valset_dir = f"data/valset"
             self.discord_webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
+            self.db = None
         
         # create data directory
         os.makedirs(self.data_dir, exist_ok=True)
@@ -121,32 +126,39 @@ class ValsetVerifier:
                 ])
 
     def load_validation_state(self) -> Dict[str, Any]:
-        """Load validation state from file"""
-        if os.path.exists(self.state_file):
-            try:
-                with open(self.state_file, 'r') as f:
-                    state = json.load(f)
-                    logger.info(f"Resuming from state: {state['total_validations']} validations completed, "
-                               f"last tx: {state.get('last_tx_hash', 'none')}")
-                    return state
-            except Exception as e:
-                logger.warning(f"Could not load validation state: {e}")
-        
-        # default state
-        return {
-            "last_tx_hash": None,
-            "last_block_number": 0,
-            "total_validations": 0,
-            "last_validation_timestamp": None
-        }
+        """Load validation state from database"""
+        try:
+            state = self.db.get_component_state('valset_verifier')
+            if state:
+                logger.info(f"Resuming from database state: {state.get('total_validations', 0)} validations completed, "
+                           f"last tx: {state.get('last_tx_hash', 'none')}")
+                return state
+            else:
+                logger.info("No previous validation state found in database, starting fresh")
+                # default state
+                return {
+                    "last_tx_hash": None,
+                    "last_block_number": 0,
+                    "total_validations": 0,
+                    "last_validation_timestamp": None
+                }
+        except Exception as e:
+            logger.warning(f"Could not load validation state from database: {e}")
+            # default state
+            return {
+                "last_tx_hash": None,
+                "last_block_number": 0,
+                "total_validations": 0,
+                "last_validation_timestamp": None
+            }
     
     def save_validation_state(self, state: Dict[str, Any]):
-        """Save validation state to file"""
+        """Save validation state to database"""
         try:
-            with open(self.state_file, 'w') as f:
-                json.dump(state, f, indent=2)
+            self.db.save_component_state('valset_verifier', state)
+            logger.debug(f"Saved validation state to database: {state}")
         except Exception as e:
-            logger.error(f"Could not save validation state: {e}")
+            logger.error(f"Could not save validation state to database: {e}")
     
     def filter_new_valset_updates(self, valset_updates: List[Dict[str, Any]], state: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Filter valset updates to only include new ones since last validation"""
@@ -175,57 +187,70 @@ class ValsetVerifier:
             return valset_updates
     
     def load_checkpoint_data(self) -> List[Dict[str, Any]]:
-        """Load checkpoint data from checkpoint_scribe"""
-        checkpoint_file = f"{self.checkpoint_dir}/{self.chain_id}_checkpoints.csv"
-        
-        if not os.path.exists(checkpoint_file):
-            raise FileNotFoundError(f"Checkpoint data not found: {checkpoint_file}")
-        
-        checkpoints = []
-        with open(checkpoint_file, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                checkpoints.append({
-                    'index': int(row['validator_index']),
-                    'timestamp': int(row['validator_timestamp']),
-                    'power_threshold': int(row['power_threshold']),
-                    'validator_set_hash': row['validator_set_hash'],
-                    'checkpoint': row['checkpoint']
+        """Load checkpoint data from database"""
+        try:
+            # get all checkpoints from database
+            checkpoints = self.db.get_all_layer_checkpoints()
+            
+            # convert to the expected format
+            formatted_checkpoints = []
+            for checkpoint in checkpoints:
+                formatted_checkpoints.append({
+                    'index': checkpoint['validator_index'],
+                    'timestamp': checkpoint['validator_timestamp'],
+                    'power_threshold': checkpoint['power_threshold'],
+                    'validator_set_hash': checkpoint['validator_set_hash'],
+                    'checkpoint': checkpoint['checkpoint']
                 })
-        
-        # sort by timestamp for efficient searching
-        checkpoints.sort(key=lambda x: x['timestamp'])
-        logger.info(f"Loaded {len(checkpoints)} checkpoints")
-        return checkpoints
-    
+            
+            # sort by timestamp for efficient searching
+            formatted_checkpoints.sort(key=lambda x: x['timestamp'])
+            logger.info(f"Loaded {len(formatted_checkpoints)} checkpoints from database")
+            return formatted_checkpoints
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint data from database: {e}")
+            return []
+
     def load_valset_data(self) -> List[Dict[str, Any]]:
-        """Load validator set update events from valset_watcher"""
-        valset_file = f"{self.valset_dir}/valset_updates.csv"  # note: may need to adjust for multi-chain
-        
-        if not os.path.exists(valset_file):
-            raise FileNotFoundError(f"Validator set data not found: {valset_file}")
-        
-        valset_updates = []
-        with open(valset_file, 'r') as f:
-            reader = csv.DictReader(f)
-            for i, row in enumerate(reader):
-                try:
-                    valset_updates.append({
-                        'timestamp': row['timestamp'],
-                        'block_number': int(row['block_number']),
-                        'tx_hash': row['tx_hash'],
-                        'log_index': int(row['log_index']),
-                        'power_threshold': int(row['power_threshold']),
-                        'validator_timestamp': int(row['validator_timestamp']),
-                        'validator_set_hash': row['validator_set_hash']
+        """Load validator set update events from database"""
+        try:
+            # get all valset updates from database
+            valset_updates = self.db.get_all_evm_valset_updates()
+            logger.info(f"Loaded {len(valset_updates)} validator set updates from database")
+            return valset_updates
+        except Exception as e:
+            logger.error(f"Failed to load valset data from database: {e}")
+            return []
+
+    def lookup_validator_set_by_timestamp(self, timestamp: int) -> Optional[List[Dict[str, Any]]]:
+        """
+        Lookup validator set by timestamp from database
+        """
+        try:
+            # get validator set from database
+            validator_set = self.db.get_layer_validator_set_by_timestamp(timestamp)
+            
+            if validator_set:
+                # convert to the expected format
+                formatted_validators = []
+                for validator in validator_set:
+                    formatted_validators.append({
+                        'ethereumAddress': validator['ethereum_address'],
+                        'power': validator['power'],
+                        'scrape_timestamp': validator['scrape_timestamp'],
+                        'valset_timestamp': validator['valset_timestamp']
                     })
-                except Exception as e:
-                    logger.warning(f"Skipping corrupted row {i+2}: {e}")
-                    continue
-        
-        logger.info(f"Loaded {len(valset_updates)} validator set updates")
-        return valset_updates
-    
+                
+                logger.debug(f"Found validator set for timestamp {timestamp}: {len(formatted_validators)} validators")
+                return formatted_validators
+            else:
+                logger.debug(f"No validator set found for timestamp {timestamp}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error loading validator set for timestamp {timestamp}: {e}")
+            return None
+
     def query_layer_checkpoint_params(self, timestamp: int) -> Optional[Dict[str, Any]]:
         """
         Query Layer to get validator checkpoint params for a specific timestamp
@@ -489,7 +514,7 @@ class ValsetVerifier:
                     return result
                 
                 # load validator set from latest checkpoint before malicious timestamp
-                validator_set = self.load_validator_set_by_checkpoint(latest_checkpoint['checkpoint'])
+                validator_set = self.lookup_validator_set_by_timestamp(latest_checkpoint['timestamp'])
                 if not validator_set:
                     result['error_details'] = f'No Layer checkpoint exists and failed to load validator set for checkpoint {latest_checkpoint["checkpoint"]}'
                     result['status'] = 'MALICIOUS_NO_VALIDATOR_DATA'
@@ -594,34 +619,36 @@ class ValsetVerifier:
         return result
     
     def write_result(self, result: Dict[str, Any]):
-        """Write validation result to CSV"""
+        """Write validation result to database"""
         try:
-            with open(self.validation_csv_file, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    result['validation_timestamp'],
-                    result['tx_hash'],
-                    result['block_number'],
-                    result['evm_power_threshold'],
-                    result['evm_validator_timestamp'],
-                    result['evm_validator_set_hash'],
-                    result['layer_power_threshold'],
-                    result['layer_validator_timestamp'],
-                    result['layer_validator_set_hash'],
-                    result['power_threshold_match'],
-                    result['timestamp_match'],
-                    result['hash_match'],
-                    result['status'],
-                    result['error_details'],
-                    result['evidence_generated'],
-                    result['is_valid_validator_signature'],
-                    result['signing_validator_count'],
-                    result['signing_power_percentage'],
-                    result['malicious_checkpoint_signed']
-                ])
-                f.flush()
+            # prepare data for database insertion
+            data = {
+                'timestamp': datetime.fromisoformat(result['validation_timestamp'].replace('Z', '+00:00')),
+                'tx_hash': result['tx_hash'],
+                'block_number': result['block_number'],
+                'evm_power_threshold': result['evm_power_threshold'],
+                'evm_validator_timestamp': result['evm_validator_timestamp'],
+                'evm_validator_set_hash': result['evm_validator_set_hash'],
+                'layer_power_threshold': result['layer_power_threshold'],
+                'layer_validator_timestamp': result['layer_validator_timestamp'],
+                'layer_validator_set_hash': result['layer_validator_set_hash'],
+                'power_threshold_match': result['power_threshold_match'],
+                'timestamp_match': result['timestamp_match'],
+                'hash_match': result['hash_match'],
+                'validation_status': result['status'],
+                'error_message': result['error_details'],
+                'evidence_generated': result['evidence_generated'],
+                'is_malicious': result['malicious_checkpoint_signed'],
+                'validator_signature_valid': result['is_valid_validator_signature'],
+                'signing_validator_count': result['signing_validator_count'],
+                'signing_power_percentage': result['signing_power_percentage']
+            }
+            
+            self.db.insert_valset_validation_result(data)
+            logger.info(f"Saved valset validation result for tx {result['tx_hash']}")
+            
         except Exception as e:
-            logger.error(f"Failed to write result: {e}")
+            logger.error(f"Failed to write validation result to database: {e}")
     
     def validate_all_valset_updates(self):
         """
@@ -696,7 +723,7 @@ class ValsetVerifier:
             # update state after each successful validation
             state["last_tx_hash"] = valset_update["tx_hash"]
             state["last_block_number"] = valset_update["block_number"]
-            state["total_validations"] = state["total_validations"] + 1
+            state["total_validations"] = state.get("total_validations", 0) + 1
             state["last_validation_timestamp"] = datetime.utcnow().isoformat()
             self.save_validation_state(state)
             
@@ -743,40 +770,6 @@ class ValsetVerifier:
                         f"timestamp {latest_checkpoint['timestamp']}")
         
         return latest_checkpoint
-
-    def load_validator_set_by_checkpoint(self, checkpoint: str) -> Optional[List[Dict[str, Any]]]:
-        """
-        Load validator set data by checkpoint from validator sets CSV
-        """
-        valset_file = f"{self.checkpoint_dir}/{self.chain_id}_validator_sets.csv"
-        
-        if not os.path.exists(valset_file):
-            logger.warning(f"Validator set data not found: {valset_file}")
-            return None
-        
-        validator_set = []
-        try:
-            with open(valset_file, 'r') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    if row['valset_checkpoint'] == checkpoint:
-                        validator_set.append({
-                            'ethereumAddress': row['ethereum_address'],
-                            'power': int(row['power']),
-                            'scrape_timestamp': row['scrape_timestamp'],
-                            'valset_timestamp': row['valset_timestamp']
-                        })
-            
-            if validator_set:
-                logger.debug(f"Loaded validator set for checkpoint {checkpoint}: {len(validator_set)} validators")
-                return validator_set
-            else:
-                logger.warning(f"No validator set found for checkpoint {checkpoint}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error loading validator set for checkpoint {checkpoint}: {e}")
-            return None
 
     def ecrecover_signature_with_validator_check(self, message_hash: bytes, signature: Dict[str, Any], 
                                                 validator_addresses: set) -> Optional[str]:

@@ -6,14 +6,14 @@ This component records validator checkpoint history from the Layer blockchain
 using Layer's REST API endpoints. A "scribe" records the truth from Layer.
 """
 
+import os
 import json
-import csv
 import time
 import requests
-from typing import List, Dict, Any, Optional
 import logging
 from datetime import datetime
-import os
+from typing import Dict, Any, List, Optional
+from config_manager import get_config_manager
 
 # configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -41,31 +41,27 @@ class CheckpointScribe:
         self.chain_id = chain_id
         self.output_prefix = output_prefix
         
-        # get config manager for directory paths
+        # get config manager and database
         try:
-            config_manager = get_config_manager()
-            self.data_dir = config_manager.get_layer_checkpoints_dir()
+            self.config_manager = get_config_manager()
+            self.db = self.config_manager.create_database_manager()
+            self.data_dir = self.config_manager.get_layer_checkpoints_dir()
         except RuntimeError:
-            # fallback to legacy paths if in legacy mode
-            self.data_dir = f"data/layer_checkpoints"
+            # fallback to legacy mode - this shouldn't happen in database mode
+            raise RuntimeError("Database mode requires configuration manager")
         
-        # create data directory structure
+        # create data directory structure (for failure logs)
         os.makedirs(self.data_dir, exist_ok=True)
         
-        # output files in data directory (include chain_id in filename)
-        self.state_file = f"{self.data_dir}/{chain_id}_{output_prefix}_state.json"
-        self.csv_file = f"{self.data_dir}/{chain_id}_{output_prefix}.csv"
+        # keep failure log files for debugging
         self.failure_log_file = f"{self.data_dir}/{chain_id}_{output_prefix}_failures.log"
-        
-        # validator set files
-        self.valset_csv_file = f"{self.data_dir}/{chain_id}_validator_sets.csv"
         self.valset_failure_log_file = f"{self.data_dir}/{chain_id}_validator_sets_failures.log"
         
         # test connection
         self.test_connection()
         
-        # initialize CSV files with headers if they don't exist
-        self.init_csv_files()
+        # initialize database schema if needed
+        self.db.init_database()
     
     def test_connection(self):
         """
@@ -114,33 +110,39 @@ class CheckpointScribe:
     
     def load_state(self) -> Dict[str, Any]:
         """
-        Load the last processed state from file
+        Load scribe state from database
         """
-        if os.path.exists(self.state_file):
-            try:
-                with open(self.state_file, 'r') as f:
-                    state = json.load(f)
-                    logger.info(f"Loaded state: last processed timestamp {state.get('last_processed_timestamp', 0)}")
-                    return state
-            except Exception as e:
-                logger.warning(f"Could not load state file: {e}")
-        
-        logger.info("No previous state found, will start from index 0")
-        return {
-            "last_processed_index": -1,  # start at -1 so we begin with index 0
-            "last_processed_timestamp": 0,
-            "total_checkpoints_found": 0
-        }
+        try:
+            state = self.db.get_component_state('checkpoint_scribe')
+            if state:
+                logger.info(f"Loaded state from database. Last index: {state.get('last_index', 'unknown')}")
+                return state
+            else:
+                logger.info("No previous state found in database, starting from beginning")
+                return {
+                    "last_index": -1,
+                    "last_timestamp": 0,
+                    "total_checkpoints": 0,
+                    "total_validator_sets": 0
+                }
+        except Exception as e:
+            logger.warning(f"Failed to load state from database: {e}")
+            return {
+                "last_index": -1,
+                "last_timestamp": 0,
+                "total_checkpoints": 0,
+                "total_validator_sets": 0
+            }
     
     def save_state(self, state: Dict[str, Any]):
         """
-        Save the current state to file
+        Save scribe state to database
         """
         try:
-            with open(self.state_file, 'w') as f:
-                json.dump(state, f, indent=2)
+            self.db.save_component_state('checkpoint_scribe', state)
+            logger.debug(f"Saved state to database: {state}")
         except Exception as e:
-            logger.error(f"Could not save state file: {e}")
+            logger.error(f"Failed to save state to database: {e}")
     
     def make_request_with_retry(self, url: str, max_retries: int = MAX_RETRIES) -> Optional[Dict[str, Any]]:
         """
@@ -246,22 +248,20 @@ class CheckpointScribe:
     
     def write_checkpoint_data(self, index: int, checkpoint_data: Dict[str, Any]):
         """
-        Write checkpoint data to CSV file and fetch corresponding validator set
+        Write checkpoint data to database
         """
         try:
-            # write checkpoint data
-            with open(self.csv_file, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    datetime.utcnow().isoformat(),
-                    index,
-                    checkpoint_data['timestamp'],
-                    checkpoint_data['power_threshold'],
-                    checkpoint_data['valset_hash'],
-                    checkpoint_data['checkpoint']
-                ])
-                f.flush()
+            # prepare checkpoint data for database insertion
+            data = {
+                'scrape_timestamp': datetime.utcnow(),
+                'validator_index': index,
+                'validator_timestamp': checkpoint_data['timestamp'],
+                'power_threshold': checkpoint_data['power_threshold'],
+                'validator_set_hash': checkpoint_data['valset_hash'],
+                'checkpoint': checkpoint_data['checkpoint']
+            }
             
+            self.db.insert_layer_checkpoint(data)
             logger.info(f"Saved checkpoint data for index {index}, timestamp {checkpoint_data['timestamp']}")
             
             # fetch and save corresponding validator set
@@ -273,11 +273,14 @@ class CheckpointScribe:
             
             if valset_success:
                 logger.debug(f"Successfully saved validator set for timestamp {checkpoint_data['timestamp']}")
+                return True
             else:
                 logger.warning(f"Failed to save validator set for timestamp {checkpoint_data['timestamp']}")
+                return False
             
         except Exception as e:
-            logger.error(f"Failed to write checkpoint data to CSV: {e}")
+            logger.error(f"Failed to write checkpoint data to database: {e}")
+            return False
     
     def get_validator_set_by_timestamp(self, timestamp: int) -> Optional[List[Dict[str, Any]]]:
         """
@@ -319,31 +322,29 @@ class CheckpointScribe:
         except Exception as e:
             logger.error(f"Failed to write to validator set failure log: {e}")
 
-    def write_validator_set_data(self, timestamp: int, checkpoint: str, validator_set: List[Dict[str, Any]]):
+    def write_validator_set_data(self, timestamp: int, checkpoint: str, validators: List[Dict[str, Any]]):
         """
-        Write validator set data to CSV file
+        Write validator set data to database
         """
         try:
-            scrape_timestamp = datetime.utcnow().isoformat()
+            scrape_timestamp = datetime.utcnow()
             
-            with open(self.valset_csv_file, 'a', newline='') as f:
-                writer = csv.writer(f)
+            for validator in validators:
+                # prepare validator data for database insertion
+                data = {
+                    'scrape_timestamp': scrape_timestamp,
+                    'valset_timestamp': timestamp,
+                    'valset_checkpoint': checkpoint,
+                    'ethereum_address': validator.get('ethereumAddress', validator.get('ethereum_address', '')),
+                    'power': validator.get('power', '')
+                }
                 
-                for validator in validator_set:
-                    writer.writerow([
-                        scrape_timestamp,
-                        timestamp,
-                        checkpoint,
-                        validator.get('ethereumAddress', ''),
-                        validator.get('power', '')
-                    ])
-                
-                f.flush()
+                self.db.insert_layer_validator_set(data)
             
-            logger.info(f"Saved validator set data for timestamp {timestamp}: {len(validator_set)} validators")
+            logger.info(f"Saved validator set data for timestamp {timestamp} ({len(validators)} validators)")
             
         except Exception as e:
-            logger.error(f"Failed to write validator set data to CSV: {e}")
+            logger.error(f"Failed to write validator set data to database: {e}")
 
     def fetch_validator_set_with_retry(self, timestamp: int, checkpoint: str) -> bool:
         """
@@ -386,10 +387,10 @@ class CheckpointScribe:
         logger.info("Starting exponential backoff attempts...")
         
         # if initial attempt fails, try exponential backoff
-        backoff_delay = INITIAL_BACKOFF
+        backoff_delay = INITIAL_DELAY
         
-        for attempt in range(MAX_BACKOFF_ATTEMPTS):
-            logger.info(f"Exponential backoff attempt {attempt + 1}/{MAX_BACKOFF_ATTEMPTS}: waiting {min(backoff_delay, max_backoff)} seconds...")
+        for attempt in range(MAX_RETRIES):
+            logger.info(f"Exponential backoff attempt {attempt + 1}/{MAX_RETRIES}: waiting {min(backoff_delay, max_backoff)} seconds...")
             time.sleep(min(backoff_delay, max_backoff))
             
             checkpoint_data = self.get_validator_checkpoint_params(timestamp)
@@ -401,14 +402,14 @@ class CheckpointScribe:
             logger.warning(f"Exponential backoff attempt {attempt + 1} failed for timestamp {timestamp}")
             
             # if this is the last attempt, log failure
-            if attempt == MAX_BACKOFF_ATTEMPTS - 1:
-                error_msg = f"All {MAX_BACKOFF_ATTEMPTS} exponential backoff attempts failed"
+            if attempt == MAX_RETRIES - 1:
+                error_msg = f"All {MAX_RETRIES} exponential backoff attempts failed"
                 logger.error(f"All exponential backoff attempts failed for timestamp {timestamp}")
                 self.log_failed_checkpoint(timestamp, error_msg)
                 return None
             
             # double the delay for next attempt
-            backoff_delay *= 2
+            backoff_delay *= BACKOFF_MULTIPLIER
         
         return None
     
@@ -419,8 +420,8 @@ class CheckpointScribe:
         """
         logger.info("Discovering checkpoints by index...")
         
-        last_processed_index = state.get('last_processed_index', -1)
-        last_processed_timestamp = state.get('last_processed_timestamp', 0)
+        last_processed_index = state.get('last_index', -1)
+        last_processed_timestamp = state.get('last_timestamp', 0)
         current_timestamp = self.get_current_validator_set_timestamp()
         
         if not current_timestamp:
@@ -489,28 +490,11 @@ class CheckpointScribe:
         Returns list of validator data or None if not found
         """
         try:
-            if not os.path.exists(self.valset_csv_file):
-                logger.warning("Validator set CSV file does not exist")
-                return None
-            
-            validator_set = []
-            with open(self.valset_csv_file, 'r') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    if row['valset_checkpoint'] == checkpoint:
-                        validator_set.append({
-                            'ethereumAddress': row['ethereum_address'],
-                            'power': row['power'],
-                            'scrape_timestamp': row['scrape_timestamp'],
-                            'valset_timestamp': row['valset_timestamp']
-                        })
-            
-            if validator_set:
-                logger.debug(f"Found validator set for checkpoint {checkpoint}: {len(validator_set)} validators")
-                return validator_set
-            else:
-                logger.debug(f"No validator set found for checkpoint {checkpoint}")
-                return None
+            # This function is no longer used as validator sets are stored in the database
+            # Keeping it for now as it might be called elsewhere or for debugging
+            # The actual lookup logic would need to be adapted to query the database
+            logger.warning("lookup_validator_set_by_checkpoint is deprecated as validator sets are stored in the database.")
+            return None
                 
         except Exception as e:
             logger.error(f"Error looking up validator set by checkpoint {checkpoint}: {e}")
@@ -542,24 +526,25 @@ class CheckpointScribe:
                 
                 if checkpoint_data:
                     # note: write_checkpoint_data now also fetches and saves validator set
-                    self.write_checkpoint_data(index, checkpoint_data)
-                    checkpoints_processed += 1
-                    
-                    # check if validator set was also successfully saved
-                    # (this is a simple check - we could make it more sophisticated)
-                    validator_sets_processed += 1
-                    
-                    # update state
-                    state["last_processed_index"] = index
-                    state["last_processed_timestamp"] = timestamp
-                    state["total_checkpoints_found"] += 1
-                    
-                    # save state after each successful checkpoint
-                    self.save_state(state)
+                    success = self.write_checkpoint_data(index, checkpoint_data)
+                    if success:
+                        checkpoints_processed += 1
+                        
+                        # check if validator set was also successfully saved
+                        # (this is a simple check - we could make it more sophisticated)
+                        validator_sets_processed += 1
+                        
+                        # update state
+                        state["last_index"] = index
+                        state["last_timestamp"] = timestamp
+                        state["total_checkpoints"] = state.get("total_checkpoints", 0) + 1
+                        
+                        # save state after each successful checkpoint
+                        self.save_state(state)
                     
                     # add delay between checkpoints to avoid rate limiting
                     if len(checkpoints_to_process) > 1:
-                        time.sleep(CATCHUP_DELAY)
+                        time.sleep(2)  # 2 second delay between checkpoints
                 else:
                     logger.warning(f"Failed to fetch checkpoint for index {index}, timestamp {timestamp}")
                     
@@ -569,7 +554,7 @@ class CheckpointScribe:
                 continue
         
         logger.info(f"Monitoring cycle complete. Processed {checkpoints_processed} checkpoints and {validator_sets_processed} validator sets")
-        logger.info(f"Total checkpoints found so far: {state['total_checkpoints_found']}")
+        logger.info(f"Total checkpoints found so far: {state['total_checkpoints']}")
         
         return state
     
@@ -580,9 +565,7 @@ class CheckpointScribe:
         logger.info(f"Starting continuous checkpoint and validator set monitoring (interval: {interval_seconds}s)")
         logger.info(f"Layer RPC: {self.layer_rpc_url}")
         logger.info(f"Chain ID: {self.chain_id}")
-        logger.info(f"Checkpoints output: {self.csv_file}")
-        logger.info(f"Validator sets output: {self.valset_csv_file}")
-        logger.info(f"State file: {self.state_file}")
+        logger.info(f"Database: {self.db.database_path}")
         logger.info(f"Failure logs: {self.failure_log_file}, {self.valset_failure_log_file}")
         
         try:

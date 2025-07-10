@@ -241,6 +241,14 @@ class BridgeMonitorDB:
                 VALUES (?, ?, CURRENT_TIMESTAMP)
             """, [component_name, json.dumps(current_state)])
     
+    def save_component_state(self, component_name: str, state: Dict[str, Any]):
+        """Save complete component state data"""
+        with self.get_connection() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO component_state (component_name, state_data, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+            """, [component_name, json.dumps(state)])
+    
     # Layer data methods (replaces checkpoint_scribe CSV operations)
     def insert_layer_checkpoint(self, data: Dict[str, Any]):
         """Insert a layer checkpoint record"""
@@ -312,6 +320,85 @@ class BridgeMonitorDB:
                 'ethereum_address': row[3],
                 'power': row[4]
             } for row in results]
+    
+    def get_all_layer_checkpoints(self) -> List[Dict[str, Any]]:
+        """Get all layer checkpoints"""
+        with self.get_connection() as conn:
+            results = conn.execute("""
+                SELECT scrape_timestamp, validator_index, validator_timestamp, power_threshold, validator_set_hash, checkpoint
+                FROM layer_checkpoints 
+                ORDER BY validator_timestamp ASC
+            """).fetchall()
+            
+            return [{
+                'scrape_timestamp': row[0],
+                'validator_index': row[1],
+                'validator_timestamp': row[2],
+                'power_threshold': row[3],
+                'validator_set_hash': row[4],
+                'checkpoint': row[5]
+            } for row in results]
+    
+    def get_all_evm_valset_updates(self) -> List[Dict[str, Any]]:
+        """Get all EVM validator set updates"""
+        with self.get_connection() as conn:
+            results = conn.execute("""
+                SELECT timestamp, block_number, tx_hash, log_index, power_threshold, validator_timestamp, validator_set_hash
+                FROM evm_valset_updates 
+                ORDER BY timestamp ASC
+            """).fetchall()
+            
+            return [{
+                'timestamp': row[0],
+                'block_number': row[1],
+                'tx_hash': row[2],
+                'log_index': row[3],
+                'power_threshold': row[4],
+                'validator_timestamp': row[5],
+                'validator_set_hash': row[6]
+            } for row in results]
+    
+    def get_all_evm_attestations(self) -> List[Dict[str, Any]]:
+        """Get all EVM attestations"""
+        with self.get_connection() as conn:
+            results = conn.execute("""
+                SELECT timestamp, block_number, tx_hash, from_address, to_address, input_data, gas_used, trace_address
+                FROM evm_attestations 
+                ORDER BY timestamp ASC
+            """).fetchall()
+            
+            return [{
+                'timestamp': row[0],
+                'block_number': row[1],
+                'tx_hash': row[2],
+                'from_address': row[3],
+                'to_address': row[4],
+                'input_data': row[5],
+                'gas_used': row[6],
+                'trace_address': json.loads(row[7]) if row[7] else []
+            } for row in results]
+    
+    def get_layer_validator_set_by_checkpoint(self, checkpoint: str) -> List[Dict[str, Any]]:
+        """Get validator set by checkpoint hash"""
+        with self.get_connection() as conn:
+            results = conn.execute("""
+                SELECT scrape_timestamp, valset_timestamp, valset_checkpoint, ethereum_address, power
+                FROM layer_validator_sets
+                WHERE valset_checkpoint = ?
+                ORDER BY power DESC
+            """, [checkpoint]).fetchall()
+            
+            return [{
+                'scrape_timestamp': row[0],
+                'valset_timestamp': row[1],
+                'valset_checkpoint': row[2], 
+                'ethereum_address': row[3],
+                'power': row[4]
+            } for row in results]
+    
+    def get_layer_validator_set_by_timestamp(self, timestamp: int) -> List[Dict[str, Any]]:
+        """Get validator set by timestamp (alias for get_validator_set_by_timestamp)"""
+        return self.get_validator_set_by_timestamp(timestamp)
     
     # EVM data methods (replaces watcher CSV operations)
     def insert_evm_valset_update(self, data: Dict[str, Any]):
