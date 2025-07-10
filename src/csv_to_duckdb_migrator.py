@@ -171,15 +171,15 @@ class CSVToDuckDBMigrator:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
+                    # handle the actual CSV format: timestamp,block_number,tx_hash,log_index,power_threshold,validator_timestamp,validator_set_hash
                     data = {
                         'timestamp': self._parse_timestamp(row['timestamp']),
                         'block_number': int(row['block_number']),
                         'tx_hash': row['tx_hash'],
-                        'from_address': row['from_address'],
-                        'to_address': row['to_address'],
-                        'input_data': row['input_data'],
-                        'gas_used': int(row['gas_used']),
-                        'trace_address': json.loads(row['trace_address']) if row['trace_address'] else []
+                        'log_index': int(row['log_index']),
+                        'power_threshold': int(row['power_threshold']),
+                        'validator_timestamp': int(row['validator_timestamp']),
+                        'validator_set_hash': row['validator_set_hash']
                     }
                     
                     if not dry_run:
@@ -209,8 +209,8 @@ class CSVToDuckDBMigrator:
                         'from_address': row['from_address'],
                         'to_address': row['to_address'],
                         'input_data': row['input_data'],
-                        'gas_used': int(row['gas_used']),
-                        'trace_address': json.loads(row['trace_address']) if row['trace_address'] else []
+                        'gas_used': self._parse_hex_or_int(row['gas_used']),  # handle hex values
+                        'trace_address': json.loads(row['trace_address']) if row.get('trace_address') else []
                     }
                     
                     if not dry_run:
@@ -233,18 +233,19 @@ class CSVToDuckDBMigrator:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
+                    # use validation_timestamp instead of timestamp
                     data = {
-                        'timestamp': self._parse_timestamp(row['timestamp']),
+                        'timestamp': self._parse_timestamp(row['validation_timestamp']),
                         'block_number': int(row['block_number']),
                         'tx_hash': row['tx_hash'],
-                        'validation_status': row['validation_status'],
-                        'error_message': row.get('error_message'),
-                        'validator_count': int(row['validator_count']) if row.get('validator_count') else None,
-                        'valid_signatures': int(row['valid_signatures']) if row.get('valid_signatures') else None,
-                        'invalid_signatures': int(row['invalid_signatures']) if row.get('invalid_signatures') else None,
-                        'layer_checkpoint': row.get('layer_checkpoint'),
-                        'evm_checkpoint': row.get('evm_checkpoint'),
-                        'is_malicious': row.get('is_malicious', '').lower() == 'true'
+                        'validation_status': row.get('status', 'UNKNOWN'),
+                        'error_message': row.get('error_details'),
+                        'validator_count': int(row['signing_validator_count']) if row.get('signing_validator_count') else None,
+                        'valid_signatures': None,  # not available in this format
+                        'invalid_signatures': None,  # not available in this format
+                        'layer_checkpoint': row.get('layer_validator_set_hash'),
+                        'evm_checkpoint': row.get('evm_validator_set_hash'),
+                        'is_malicious': row.get('malicious_checkpoint_signed', '').lower() == 'true'
                     }
                     
                     if not dry_run:
@@ -267,16 +268,17 @@ class CSVToDuckDBMigrator:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
+                    # use validation_timestamp instead of timestamp
                     data = {
-                        'timestamp': self._parse_timestamp(row['timestamp']),
+                        'timestamp': self._parse_timestamp(row['validation_timestamp']),
                         'block_number': int(row['block_number']),
                         'tx_hash': row['tx_hash'],
-                        'validation_status': row['validation_status'],
-                        'error_message': row.get('error_message'),
-                        'oracle_data_hash': row.get('oracle_data_hash'),
-                        'layer_checkpoint': row.get('layer_checkpoint'),
-                        'snapshot_exists': row.get('snapshot_exists', '').lower() == 'true',
-                        'is_malicious': row.get('is_malicious', '').lower() == 'true'
+                        'validation_status': row.get('status', 'UNKNOWN'),
+                        'error_message': row.get('error_details'),
+                        'oracle_data_hash': row.get('value_hash'),
+                        'layer_checkpoint': row.get('checkpoint_used'),
+                        'snapshot_exists': row.get('layer_snapshot_exists', '').lower() == 'true',
+                        'is_malicious': row.get('status', '').upper() == 'MALICIOUS'
                     }
                     
                     if not dry_run:
@@ -365,6 +367,16 @@ class CSVToDuckDBMigrator:
         except:
             # if that fails, return as-is
             return timestamp_str
+    
+    def _parse_hex_or_int(self, value_str: str) -> int:
+        """Parse a value that could be hex (0x...) or decimal integer"""
+        try:
+            if value_str.startswith('0x'):
+                return int(value_str, 16)
+            else:
+                return int(value_str)
+        except (ValueError, AttributeError):
+            return 0
     
     def _print_migration_summary(self, config_name: str, stats: Dict[str, int], dry_run: bool):
         """Print migration summary"""

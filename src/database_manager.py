@@ -108,11 +108,10 @@ class BridgeMonitorDB:
                     timestamp TIMESTAMP,
                     block_number BIGINT,
                     tx_hash VARCHAR,
-                    from_address VARCHAR,
-                    to_address VARCHAR,
-                    input_data TEXT,
-                    gas_used BIGINT,
-                    trace_address JSON,
+                    log_index INTEGER,
+                    power_threshold BIGINT,
+                    validator_timestamp BIGINT,
+                    validator_set_hash VARCHAR,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -189,6 +188,8 @@ class BridgeMonitorDB:
             "CREATE INDEX IF NOT EXISTS idx_layer_checkpoints_hash ON layer_checkpoints(validator_set_hash)",
             "CREATE INDEX IF NOT EXISTS idx_layer_validator_sets_timestamp ON layer_validator_sets(valset_timestamp)",
             "CREATE INDEX IF NOT EXISTS idx_evm_valset_block ON evm_valset_updates(block_number)",
+            "CREATE INDEX IF NOT EXISTS idx_evm_valset_timestamp ON evm_valset_updates(validator_timestamp)",
+            "CREATE INDEX IF NOT EXISTS idx_evm_valset_hash ON evm_valset_updates(validator_set_hash)",
             "CREATE INDEX IF NOT EXISTS idx_evm_attestations_block ON evm_attestations(block_number)",
             "CREATE INDEX IF NOT EXISTS idx_valset_validation_tx ON valset_validation_results(tx_hash)",
             "CREATE INDEX IF NOT EXISTS idx_attestation_validation_tx ON attestation_validation_results(tx_hash)",
@@ -318,17 +319,16 @@ class BridgeMonitorDB:
         with self.get_connection() as conn:
             conn.execute("""
                 INSERT INTO evm_valset_updates
-                (timestamp, block_number, tx_hash, from_address, to_address, input_data, gas_used, trace_address)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (timestamp, block_number, tx_hash, log_index, power_threshold, validator_timestamp, validator_set_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """, [
                 data['timestamp'],
                 data['block_number'],
                 data['tx_hash'],
-                data['from_address'],
-                data['to_address'], 
-                data['input_data'],
-                data['gas_used'],
-                json.dumps(data['trace_address'])
+                data['log_index'],
+                data['power_threshold'],
+                data['validator_timestamp'],
+                data['validator_set_hash']
             ])
     
     def insert_evm_attestation(self, data: Dict[str, Any]):
