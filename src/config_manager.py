@@ -199,6 +199,19 @@ class ConfigManager:
         """Get Discord webhook URL"""
         return self._active_config.get('discord_webhook_url')
     
+    def get_discord_webhook(self, webhook_type: str) -> Optional[str]:
+        """Get specific Discord webhook URL by type"""
+        # try new discord_webhooks structure first
+        webhooks = self._active_config.get('discord_webhooks', {})
+        if webhook_type in webhooks:
+            return webhooks[webhook_type]
+        
+        # fallback to legacy webhook for malicious_activity
+        if webhook_type == 'malicious_activity':
+            return self.get_discord_webhook_url()
+        
+        return None
+    
     def get_data_dir(self) -> str:
         """Get data directory for active configuration"""
         return self._active_config['data_dir']

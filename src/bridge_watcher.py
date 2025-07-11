@@ -395,6 +395,7 @@ Examples:
   bridgewatch config show            # show active configuration details
   bridgewatch config switch <name>   # switch to different configuration
   bridgewatch config validate        # validate current configuration
+  bridgewatch valset-alerts          # monitor and alert on validator set updates
         """
     )
     
@@ -461,6 +462,13 @@ Examples:
         for arg_config in cmd_info['args']:
             arg_names, arg_kwargs = arg_config
             db_cmd_parser.add_argument(*arg_names, **arg_kwargs)
+    
+    # valset-alerts command  
+    valset_alerts_parser = subparsers.add_parser('valset-alerts', help='Monitor and alert on validator set updates')
+    valset_alerts_parser.add_argument('--once', action='store_true', help='Run once instead of continuously')
+    valset_alerts_parser.add_argument('--interval', type=int, default=60, help='Check interval in seconds (default: 60)')
+    valset_alerts_parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
+    valset_alerts_parser.add_argument('--no-color', action='store_true', help='Disable colored output')
     
     args = parser.parse_args()
     
@@ -630,6 +638,24 @@ Examples:
                 DATABASE_COMMANDS[db_command]['func'](args)
             else:
                 logger.error(f"❌ Unknown database command: {db_command}")
+                sys.exit(1)
+            
+        elif args.command == 'valset-alerts':
+            from valset_alerter import ValsetAlerter
+            
+            logger.info("🔔 Starting Valset Alerter...")
+            
+            try:
+                alerter = ValsetAlerter()
+                
+                if args.once:
+                    alerts_sent = alerter.run_once()
+                    logger.info(f"✅ Sent {alerts_sent} valset update alerts")
+                else:
+                    alerter.run_continuous(args.interval)
+                    
+            except Exception as e:
+                logger.error(f"❌ Valset alerter failed: {e}")
                 sys.exit(1)
             
     except Exception as e:

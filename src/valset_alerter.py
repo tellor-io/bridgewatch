@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""
+Valset Alerter
+
+This component monitors the evm_valset_updates table and sends Discord alerts
+for every validator set update in the bridge contract.
+
+Features:
+- Monitors evm_valset_updates table for new entries
+- Sends formatted Discord alerts with valset details
+- Converts timestamps to US Eastern timezone  
+- Looks up Ethereum block timestamps
+- Maintains state for resuming from last processed update
+"""
+
+import json
+import time
+import requests
+import logging
+from datetime import datetime
+from typing import Dict, Any, List, Optional
+from web3 import Web3
+import pytz
+from config_manager import get_config_manager
+
+# configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class ValsetAlerter:
+    def __init__(self):
+        """Initialize the valset alerter"""
+        try:
+            self.config_manager = get_config_manager()
+            self.db = self.config_manager.create_database_manager()
+            
+            # get configuration
+            self.bridge_contract = self.config_manager.get_bridge_contract()
+            self.evm_rpc_url = self.config_manager.get_evm_rpc_url()
+            self.layer_chain = self.config_manager.get_layer_chain()
+            self.evm_chain = self.config_manager.get_evm_chain()
+            
+            # get Discord webhook for valset updates
+            self.discord_webhook_url = self.get_valset_discord_webhook()
+            
+            # initialize Web3 for block timestamp lookups
+            self.w3 = Web3(Web3.HTTPProvider(self.evm_rpc_url))
+            if not self.w3.is_connected():
+                raise ConnectionError("Failed to connect to EVM RPC")
+            
+            # set up timezone converter
+            self.eastern_tz = pytz.timezone('US/Eastern')
+            
+            logger.info(f"Initialized ValsetAlerter for {self.layer_chain} → {self.evm_chain}")
+            logger.info(f"Bridge contract: {self.bridge_contract}")
+            logger.info(f"Discord alerts: {'enabled' if self.discord_webhook_url else 'disabled'}")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize ValsetAlerter: {e}")
+            raise
+    
+    def get_valset_discord_webhook(self) -> Optional[str]:
+        """Get the Discord webhook URL for valset updates"""
+        # try new discord_webhooks structure first
+        webhooks = self.config_manager.get_active_config().get('discord_webhooks', {})
+        if 'valset_updates' in webhooks:
+            return webhooks['valset_updates']
+        
+        # fallback to legacy webhook (with warning)
+        legacy_webhook = self.config_manager.get_discord_webhook_url()
+        if legacy_webhook:
+            logger.warning("Using legacy discord_webhook_url. Consider updating config to use discord_webhooks.valset_updates")
+            return legacy_webhook
+        
+        # try environment variable
+        import os
+        env_webhook = os.getenv('DISCORD_WEBHOOK_VALSET_URL')
+        if env_webhook:
+            return env_webhook
+            
+        logger.warning("No Discord webhook configured for valset updates")
+        return None
+    
+    def load_alerter_state(self) -> Dict[str, Any]:
+        """Load alerter state from database"""
+        try:
+            state = self.db.get_component_state('valset_alerter')
+            if state:
+                logger.info(f"Resuming from database state: {state.get('total_alerts_sent', 0)} alerts sent, "
+                           f"last update: {state.get('last_tx_hash', 'none')}")
+                return state
+            else:
+                logger.info("No previous alerter state found in database, starting fresh")
+                return {
+                    "last_tx_hash": None,
+                    "last_block_number": 0,
+                    "total_alerts_sent": 0,
+                    "last_alert_timestamp": None
+                }
+        except Exception as e:
+            logger.warning(f"Could not load alerter state from database: {e}")
+            return {
+                "last_tx_hash": None,
+                "last_block_number": 0,
+                "total_alerts_sent": 0,
+                "last_alert_timestamp": None
+            }
+    
+    def save_alerter_state(self, state: Dict[str, Any]):
+        """Save alerter state to database"""
+        try:
+            self.db.save_component_state('valset_alerter', state)
+            logger.debug(f"Saved alerter state to database: {state}")
+        except Exception as e:
+            logger.error(f"Could not save alerter state to database: {e}")
+    
+    def get_new_valset_updates(self, state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Get new validator set updates since last alert"""
+        try:
+            # get all valset updates from database
+            all_updates = self.db.get_all_evm_valset_updates()
+            
+            if not state.get("last_tx_hash"):
+                # first run, process all
+                logger.info(f"First run: found {len(all_updates)} total valset updates")
+                return all_updates
+            
+            # filter to only new updates
+            last_tx_hash = state["last_tx_hash"]
+            last_block_number = state["last_block_number"]
+            
+            # find the index of the last processed update
+            last_index = -1
+            for i, update in enumerate(all_updates):
+                if update["tx_hash"] == last_tx_hash and update["block_number"] == last_block_number:
+                    last_index = i
+                    break
+            
+            if last_index >= 0:
+                new_updates = all_updates[last_index + 1:]
+                logger.info(f"Found {len(new_updates)} new valset updates since last run")
+                return new_updates
+            else:
+                logger.warning(f"Could not find last processed update {last_tx_hash}, processing all")
+                return all_updates
+                
+        except Exception as e:
+            logger.error(f"Failed to get valset updates from database: {e}")
+            return []
+    
+    def get_ethereum_block_timestamp(self, block_number: int) -> Optional[datetime]:
+        """Get timestamp of an Ethereum block"""
+        try:
+            block = self.w3.eth.get_block(block_number)
+            return datetime.fromtimestamp(block.timestamp, tz=pytz.UTC)
+        except Exception as e:
+            logger.error(f"Failed to get block timestamp for block {block_number}: {e}")
+            return None
+    
+    def format_timestamp(self, timestamp_ms: int) -> str:
+        """Convert millisecond timestamp to US Eastern time string"""
+        try:
+            # convert milliseconds to seconds
+            timestamp_seconds = timestamp_ms / 1000
+            # create UTC datetime
+            utc_dt = datetime.fromtimestamp(timestamp_seconds, tz=pytz.UTC)
+            # convert to Eastern time
+            eastern_dt = utc_dt.astimezone(self.eastern_tz)
+            return eastern_dt.strftime('%Y-%m-%d %H:%M:%S %Z')
+        except Exception as e:
+            logger.error(f"Failed to format timestamp {timestamp_ms}: {e}")
+            return f"{timestamp_ms} ms (format error)"
+    
+    def send_valset_alert(self, update: Dict[str, Any]) -> bool:
+        """Send Discord alert for a validator set update"""
+        if not self.discord_webhook_url:
+            logger.debug("No Discord webhook configured, skipping alert")
+            return False
+        
+        try:
+            # get Ethereum block timestamp
+            eth_block_time = self.get_ethereum_block_timestamp(update['block_number'])
+            eth_time_str = "Unknown"
+            if eth_block_time:
+                eth_eastern = eth_block_time.astimezone(self.eastern_tz)
+                eth_time_str = eth_eastern.strftime('%Y-%m-%d %H:%M:%S %Z')
+            
+            # format validator set timestamp
+            valset_time_str = self.format_timestamp(update['validator_timestamp'])
+            
+            # create Discord embed
+            embed = {
+                "title": "🔄 Bridge Validator Set Updated",
+                "description": f"Validator set updated in {self.layer_chain} → {self.evm_chain} bridge",
+                "color": 0x3498db,  # blue
+                "fields": [
+                    {
+                        "name": "💪 New Power Threshold",
+                        "value": f"`{update['power_threshold']:,}`",
+                        "inline": True
+                    },
+                    {
+                        "name": "🕒 Validator Set Timestamp",
+                        "value": f"`{update['validator_timestamp']:,}` ms\n{valset_time_str}",
+                        "inline": True
+                    },
+                    {
+                        "name": "📋 Checkpoint Hash",
+                        "value": f"`{update['validator_set_hash'][:10]}...{update['validator_set_hash'][-8:]}`",
+                        "inline": False
+                    },
+                    {
+                        "name": "⛓️ Ethereum Details",
+                        "value": f"**Block:** `{update['block_number']:,}`\n**Time:** {eth_time_str}",
+                        "inline": True
+                    },
+                    {
+                        "name": "🔗 Transaction",
+                        "value": f"[View on Etherscan](https://{'sepolia.' if self.evm_chain == 'sepolia' else ''}etherscan.io/tx/{update['tx_hash']})",
+                        "inline": True
+                    }
+                ],
+                "footer": {
+                    "text": f"Bridge Contract: {self.bridge_contract}"
+                },
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+            payload = {
+                "username": "Bridge Monitor",
+                "embeds": [embed]
+            }
+            
+            response = requests.post(self.discord_webhook_url, json=payload, timeout=10)
+            response.raise_for_status()
+            
+            logger.info(f"✅ Sent Discord alert for valset update {update['tx_hash']}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to send Discord alert for {update['tx_hash']}: {e}")
+            return False
+    
+    def run_once(self) -> int:
+        """Run once and process all new valset updates"""
+        logger.info("Starting valset alerter (run once)")
+        
+        # load state
+        state = self.load_alerter_state()
+        
+        # get new updates
+        new_updates = self.get_new_valset_updates(state)
+        
+        if not new_updates:
+            logger.info("No new valset updates to alert on")
+            return 0
+        
+        logger.info(f"Processing {len(new_updates)} new valset updates")
+        
+        alerts_sent = 0
+        for i, update in enumerate(new_updates):
+            logger.info(f"Processing update {i+1}/{len(new_updates)}: {update['tx_hash']}")
+            
+            # send alert
+            if self.send_valset_alert(update):
+                alerts_sent += 1
+            
+            # update state after each alert
+            state['last_tx_hash'] = update['tx_hash']
+            state['last_block_number'] = update['block_number']
+            state['total_alerts_sent'] = state.get('total_alerts_sent', 0) + 1
+            state['last_alert_timestamp'] = datetime.utcnow().isoformat()
+            self.save_alerter_state(state)
+            
+            # small delay between alerts
+            time.sleep(1)
+        
+        logger.info(f"✅ Sent {alerts_sent} valset update alerts")
+        logger.info(f"📊 Total alerts sent: {state['total_alerts_sent']}")
+        
+        return alerts_sent
+    
+    def run_continuous(self, interval_seconds: int = 60):
+        """Run continuously, checking for new updates every interval"""
+        logger.info(f"Starting valset alerter (continuous mode, interval: {interval_seconds}s)")
+        
+        while True:
+            try:
+                alerts_sent = self.run_once()
+                if alerts_sent > 0:
+                    logger.info(f"Cycle complete: sent {alerts_sent} alerts")
+                else:
+                    logger.debug("Cycle complete: no new updates")
+                
+                logger.info(f"Sleeping for {interval_seconds} seconds...")
+                time.sleep(interval_seconds)
+                
+            except KeyboardInterrupt:
+                logger.info("Received interrupt signal, shutting down...")
+                break
+            except Exception as e:
+                logger.error(f"Error in continuous loop: {e}")
+                logger.info(f"Retrying in {interval_seconds} seconds...")
+                time.sleep(interval_seconds)
+
+
+def main():
+    """Main entry point for valset alerter"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="Valset Alerter - Send Discord alerts for bridge validator set updates"
+    )
+    
+    parser.add_argument('--once', action='store_true', help='Run once instead of continuously')
+    parser.add_argument('--interval', type=int, default=60, 
+                       help='Check interval in seconds for continuous mode (default: 60)')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
+    
+    args = parser.parse_args()
+    
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    try:
+        alerter = ValsetAlerter()
+        
+        if args.once:
+            alerts_sent = alerter.run_once()
+            print(f"Sent {alerts_sent} alerts")
+        else:
+            alerter.run_continuous(args.interval)
+            
+    except Exception as e:
+        logger.error(f"Valset alerter failed: {e}")
+        exit(1)
+
+
+if __name__ == "__main__":
+    main()
