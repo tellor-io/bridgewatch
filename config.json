@@ -1,9 +1,49 @@
 {
-  "networks": {
-    "sepolia": {
-      "chain_id": "layertest-4",
-      "bridge_address": "0xC69f43741D379cE93bdaAC9b5135EA3e697df1F8",
-      "layer_rpc_url": "https://node-palmito.tellorlayer.com"
+  "configs": {
+    "layertest-4-sepolia-bridge": {
+      "display_name": "Layer Testnet 4 → Sepolia Bridge",
+      "layer_chain": "layertest-4",
+      "evm_chain": "sepolia", 
+      "bridge_contract": "0xC69f43741D379cE93bdaAC9b5135EA3e697df1F8",
+      "layer_rpc_url": "https://node-palmito.tellorlayer.com",
+      "evm_rpc_url": "${EVM_RPC_URL_SEPOLIA}",
+      "discord_webhook_url": "${DISCORD_WEBHOOK_URL_SEPOLIA}",
+      "discord_webhooks": {
+        "malicious_activity": "${DISCORD_WEBHOOK_URL_SEPOLIA}",
+        "valset_updates": "${DISCORD_VALSET_ALERTS_SEPOLIA}"
+      },
+      "data_dir": "data/layertest-4_sepolia_0xC69f43741D379cE93bdaAC9b5135EA3e697df1F8",
+      "database_path": "databases/layertest-4_sepolia_0xC69f43741D379cE93bdaAC9b5135EA3e697df1F8.duckdb"
+    },
+    "layerlocal-1-sepolia-bridge": {
+      "display_name": "Layer Local 1 → Sepolia Bridge",
+      "layer_chain": "layerlocal-1",
+      "evm_chain": "sepolia", 
+      "bridge_contract": "0xCe12E80e297546c01319F2A856786193AA56B632",
+      "layer_rpc_url": "http://localhost:1317/",
+      "evm_rpc_url": "${EVM_RPC_URL_SEPOLIA}",
+      "discord_webhook_url": "${DISCORD_WEBHOOK_URL_SEPOLIA}",
+      "discord_webhooks": {
+        "malicious_activity": "${DISCORD_WEBHOOK_URL_SEPOLIA}",
+        "valset_updates": "${DISCORD_VALSET_ALERTS_SEPOLIA}"
+      },
+      "data_dir": "data/layerlocal-1_sepolia_bridge",
+      "database_path": "databases/layerlocal-1_sepolia_bridge.duckdb"
+    },
+    "layerlocal-2-sepolia-bridge": {
+      "display_name": "Layer Local 2 → Sepolia Bridge",
+      "layer_chain": "layerlocal-2",
+      "evm_chain": "sepolia", 
+      "bridge_contract": "0xCe12E80e297546c01319F2A856786193AA56B632",
+      "layer_rpc_url": "http://localhost:1317/",
+      "evm_rpc_url": "${EVM_RPC_URL_SEPOLIA}",
+      "discord_webhook_url": "${DISCORD_WEBHOOK_URL_SEPOLIA}",
+      "discord_webhooks": {
+        "malicious_activity": "${DISCORD_WEBHOOK_URL_SEPOLIA}",
+        "valset_updates": "${DISCORD_VALSET_ALERTS_SEPOLIA}"
+      },
+      "data_dir": "data/layerlocal-2_sepolia_bridge",
+      "database_path": "databases/layerlocal-2_sepolia_bridge.duckdb"
     }
   },
   "contracts": {

@@ -12,26 +12,27 @@ This component validates attestations by:
 A "verifier" emphasizes analysis and truth-checking against Layer.
 """
 
-import json
+import os
 import csv
+import json
 import time
 import requests
-from typing import List, Dict, Any, Optional, Tuple
-from web3 import Web3
-from eth_abi import decode
 import logging
 from datetime import datetime
-import os
+from typing import Dict, Any, List, Optional, Tuple
+from web3 import Web3
+from eth_abi import decode
 import hashlib
 from eth_keys import keys
 from eth_utils import decode_hex
+from config_manager import get_config_manager
 
 # configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # import config
-from config import config
+from config import config, get_config_manager
 
 # configuration from config module
 DEFAULT_LAYER_RPC_URL = config.get_layer_rpc_url()
@@ -39,35 +40,57 @@ NEW_REPORT_ATTESTATION_DOMAIN_SEPARATOR = config.get_domain_separator('new_repor
 VALIDATOR_SET_HASH_DOMAIN_SEPARATOR = config.get_domain_separator('validator_set_hash')
 VERIFY_ORACLE_DATA_SELECTOR = config.get_function_selector('verifyOracleData')
 
+# exponential backoff parameters
+INITIAL_DELAY = 1  # seconds
+MAX_DELAY = 60     # max seconds to wait
+BACKOFF_MULTIPLIER = 2
+MAX_RETRIES = 6    # number of exponential backoff attempts
+
 class AttestVerifier:
-    def __init__(self, layer_rpc_url: str, chain_id: str):
+    def __init__(self, layer_rpc_url: str, chain_id: str, output_prefix: str = "attestation_validation_results", disable_discord: bool = False):
         self.layer_rpc_url = layer_rpc_url.rstrip('/')
         self.chain_id = chain_id
+        self.output_prefix = output_prefix
+        self.disable_discord = disable_discord
+        
         self.w3 = Web3()  # for ABI decoding only
         
-        # create output directory
-        self.data_dir = f"data/validation"
+        # get config manager and database
+        try:
+            self.config_manager = get_config_manager()
+            self.db = self.config_manager.create_database_manager()
+            self.data_dir = self.config_manager.get_validation_dir()
+            self.oracle_dir = self.config_manager.get_oracle_dir()
+            self.checkpoint_dir = self.config_manager.get_layer_checkpoints_dir()
+        except RuntimeError:
+            # fallback to legacy mode - this shouldn't happen in database mode
+            raise RuntimeError("Database mode requires configuration manager")
+        
+        # create data directory structure (for failure logs)
         os.makedirs(self.data_dir, exist_ok=True)
         
-        # output files
-        self.results_file = f"{self.data_dir}/{chain_id}_attestation_validation_results.csv"
-        self.failure_log_file = f"{self.data_dir}/{chain_id}_attestation_validation_failures.log"
-        self.state_file = f"{self.data_dir}/{chain_id}_attestation_validation_state.json"
+        # keep validation files for debugging
+        self.validation_csv_file = f"{self.data_dir}/{chain_id}_{output_prefix}.csv"
+        self.evidence_file = f"{self.data_dir}/{chain_id}_attestation_evidence.txt"
         
-        # initialize CSV file
-        self.init_results_csv()
+        # test connection
+        self.test_connection()
         
-        # test connection to Layer
-        self.test_layer_connection()
+        # initialize database schema if needed
+        self.db.init_database()
         
-        # discord webhook URL (from environment variable)
-        self.discord_webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
-        if self.discord_webhook_url:
-            logger.info("Discord alerts enabled")
+        # discord webhook URL (from environment variable, unless disabled)
+        if self.disable_discord:
+            self.discord_webhook_url = None
+            logger.warning("Discord alerts: DISABLED via --no-discord flag")
         else:
-            logger.info("Discord alerts disabled (DISCORD_WEBHOOK_URL not set)")
+            self.discord_webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
+            if self.discord_webhook_url:
+                logger.info("Discord alerts enabled")
+            else:
+                logger.info("Discord alerts disabled (DISCORD_WEBHOOK_URL not set)")
     
-    def test_layer_connection(self):
+    def test_connection(self):
         """Test connection to Layer RPC"""
         try:
             url = f"{self.layer_rpc_url}/layer/bridge/get_current_validator_set_timestamp"
@@ -77,59 +100,40 @@ class AttestVerifier:
         except Exception as e:
             raise ConnectionError(f"Failed to connect to Layer RPC: {e}")
     
-    def init_results_csv(self):
-        """Initialize results CSV file"""
-        if not os.path.exists(self.results_file):
-            with open(self.results_file, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    'validation_timestamp',
-                    'tx_hash',
-                    'block_number', 
-                    'attestation_timestamp',
-                    'query_id',
-                    'value_hash',
-                    'report_timestamp',
-                    'aggregate_power',
-                    'snapshot',
-                    'checkpoint_used',
-                    'checkpoint_timestamp',
-                    'is_valid_validator_signature',
-                    'signing_validator_count',
-                    'signing_power_percentage',
-                    'layer_snapshot_exists',
-                    'signature_valid',
-                    'status',
-                    'error_details'
-                ])
-
     def load_validation_state(self) -> Dict[str, Any]:
-        """Load validation state from file"""
-        if os.path.exists(self.state_file):
-            try:
-                with open(self.state_file, 'r') as f:
-                    state = json.load(f)
-                    logger.info(f"Resuming from state: {state['total_validations']} validations completed, "
-                               f"last tx: {state.get('last_tx_hash', 'none')}")
-                    return state
-            except Exception as e:
-                logger.warning(f"Could not load validation state: {e}")
-        
-        # default state
-        return {
-            "last_tx_hash": None,
-            "last_block_number": 0,
-            "total_validations": 0,
-            "last_validation_timestamp": None
-        }
+        """Load validation state from database"""
+        try:
+            state = self.db.get_component_state('attest_verifier')
+            if state:
+                logger.info(f"Resuming from database state: {state.get('total_validations', 0)} validations completed, "
+                           f"last tx: {state.get('last_tx_hash', 'none')}")
+                return state
+            else:
+                logger.info("No previous validation state found in database, starting fresh")
+                # default state
+                return {
+                    "last_tx_hash": None,
+                    "last_block_number": 0,
+                    "total_validations": 0,
+                    "last_validation_timestamp": None
+                }
+        except Exception as e:
+            logger.warning(f"Could not load validation state from database: {e}")
+            # default state
+            return {
+                "last_tx_hash": None,
+                "last_block_number": 0,
+                "total_validations": 0,
+                "last_validation_timestamp": None
+            }
     
     def save_validation_state(self, state: Dict[str, Any]):
-        """Save validation state to file"""
+        """Save validation state to database"""
         try:
-            with open(self.state_file, 'w') as f:
-                json.dump(state, f, indent=2)
+            self.db.save_component_state('attest_verifier', state)
+            logger.debug(f"Saved validation state to database: {state}")
         except Exception as e:
-            logger.error(f"Could not save validation state: {e}")
+            logger.error(f"Could not save validation state to database: {e}")
     
     def filter_new_attestations(self, attestations: List[Dict[str, Any]], state: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Filter attestations to only include new ones since last validation"""
@@ -158,84 +162,62 @@ class AttestVerifier:
             return attestations
     
     def load_checkpoint_data(self) -> List[Dict[str, Any]]:
-        """Load checkpoint data from checkpoint_scribe"""
-        checkpoint_file = f"data/layer_checkpoints/{self.chain_id}_checkpoints.csv"
-        
-        if not os.path.exists(checkpoint_file):
-            raise FileNotFoundError(f"Checkpoint data not found: {checkpoint_file}")
-        
-        checkpoints = []
-        with open(checkpoint_file, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                checkpoints.append({
-                    'index': int(row['validator_index']),
-                    'timestamp': int(row['validator_timestamp']),
-                    'power_threshold': int(row['power_threshold']),
-                    'validator_set_hash': row['validator_set_hash'],
-                    'checkpoint': row['checkpoint']
+        """Load checkpoint data from database"""
+        try:
+            # get all checkpoints from database
+            checkpoints = self.db.get_all_layer_checkpoints()
+            
+            # convert to the expected format
+            formatted_checkpoints = []
+            for checkpoint in checkpoints:
+                formatted_checkpoints.append({
+                    'index': checkpoint['validator_index'],
+                    'timestamp': checkpoint['validator_timestamp'],
+                    'power_threshold': checkpoint['power_threshold'],
+                    'validator_set_hash': checkpoint['validator_set_hash'],
+                    'checkpoint': checkpoint['checkpoint']
                 })
-        
-        # sort by timestamp for efficient searching
-        checkpoints.sort(key=lambda x: x['timestamp'])
-        logger.info(f"Loaded {len(checkpoints)} checkpoints")
-        return checkpoints
+            
+            # sort by timestamp for efficient searching
+            formatted_checkpoints.sort(key=lambda x: x['timestamp'])
+            logger.info(f"Loaded {len(formatted_checkpoints)} checkpoints from database")
+            return formatted_checkpoints
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint data from database: {e}")
+            return []
     
     def load_attestation_data(self) -> List[Dict[str, Any]]:
-        """Load attestation calldata from attest_watcher"""
-        attestation_file = f"data/oracle/attestations.csv"  # note: may need to adjust for multi-chain
-        
-        if not os.path.exists(attestation_file):
-            raise FileNotFoundError(f"Attestation data not found: {attestation_file}")
-        
-        attestations = []
-        with open(attestation_file, 'r') as f:
-            reader = csv.DictReader(f)
-            for i, row in enumerate(reader):
-                try:
-                    attestations.append({
-                        'timestamp': row['timestamp'],
-                        'block_number': int(row['block_number']),
-                        'tx_hash': row['tx_hash'],
-                        'from_address': row['from_address'],
-                        'to_address': row['to_address'],
-                        'input_data': row['input_data'],
-                        'gas_used': row['gas_used'],
-                        'trace_address': json.loads(row['trace_address'])
-                    })
-                except Exception as e:
-                    logger.warning(f"Skipping corrupted row {i+2}: {e}")
-                    continue
-        
-        logger.info(f"Loaded {len(attestations)} attestation calls")
-        return attestations
+        """Load attestation calldata from database"""
+        try:
+            # get all attestations from database
+            attestations = self.db.get_all_evm_attestations()
+            logger.info(f"Loaded {len(attestations)} attestation calls from database")
+            return attestations
+        except Exception as e:
+            logger.error(f"Failed to load attestation data from database: {e}")
+            return []
 
     def load_validator_set_by_checkpoint(self, checkpoint: str) -> Optional[List[Dict[str, Any]]]:
         """
-        Load validator set data by checkpoint from validator sets CSV
+        Load validator set data by checkpoint from database
         """
-        valset_file = f"data/layer_checkpoints/{self.chain_id}_validator_sets.csv"
-        
-        if not os.path.exists(valset_file):
-            logger.warning(f"Validator set data not found: {valset_file}")
-            return None
-        
-        validator_set = []
         try:
-            with open(valset_file, 'r') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    if row['valset_checkpoint'] == checkpoint:
-                        validator_set.append({
-                            'ethereumAddress': row['ethereum_address'],
-                            'power': int(row['power']),
-                            'scrape_timestamp': row['scrape_timestamp'],
-                            'valset_timestamp': row['valset_timestamp']
-                        })
+            # get validator set from database
+            validator_set = self.db.get_layer_validator_set_by_checkpoint(checkpoint)
             
             if validator_set:
-                logger.debug(f"Loaded validator set for checkpoint {checkpoint}: {len(validator_set)} validators")
-                return validator_set
+                # convert to the expected format
+                formatted_validators = []
+                for validator in validator_set:
+                    formatted_validators.append({
+                        'ethereumAddress': validator['ethereum_address'],
+                        'power': validator['power'],
+                        'scrape_timestamp': validator['scrape_timestamp'],
+                        'valset_timestamp': validator['valset_timestamp']
+                    })
+                
+                logger.debug(f"Loaded validator set for checkpoint {checkpoint}: {len(formatted_validators)} validators")
+                return formatted_validators
             else:
                 logger.warning(f"No validator set found for checkpoint {checkpoint}")
                 return None
@@ -364,6 +346,10 @@ class AttestVerifier:
         """
         Send Discord alert for malicious attestations from valid validators
         """
+        if self.disable_discord:
+            logger.debug("Discord alerts disabled via --no-discord flag, skipping alert")
+            return
+            
         if not self.discord_webhook_url:
             logger.debug("Discord webhook URL not configured, skipping alert")
             return
@@ -774,33 +760,35 @@ class AttestVerifier:
         return result
     
     def write_result(self, result: Dict[str, Any]):
-        """Write validation result to CSV"""
+        """Write validation result to database"""
         try:
-            with open(self.results_file, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    result['validation_timestamp'],
-                    result['tx_hash'],
-                    result['block_number'],
-                    result['attestation_timestamp'],
-                    result['query_id'],
-                    result['value_hash'],
-                    result['report_timestamp'],
-                    result['aggregate_power'],
-                    result['snapshot'],
-                    result['checkpoint_used'],
-                    result['checkpoint_timestamp'],
-                    result['is_valid_validator_signature'],
-                    result['signing_validator_count'],
-                    result['signing_power_percentage'],
-                    result['layer_snapshot_exists'],
-                    result['signature_valid'],
-                    result['status'],
-                    result['error_details']
-                ])
-                f.flush()
+            # prepare data for database insertion
+            data = {
+                'timestamp': datetime.fromisoformat(result['validation_timestamp'].replace('Z', '+00:00')),
+                'tx_hash': result['tx_hash'],
+                'block_number': result['block_number'],
+                'attestation_timestamp': result['attestation_timestamp'],
+                'query_id': result['query_id'],
+                'value_hash': result['value_hash'],
+                'report_timestamp': result['report_timestamp'],
+                'aggregate_power': result['aggregate_power'],
+                'snapshot': result['snapshot'],
+                'checkpoint_used': result['checkpoint_used'],
+                'checkpoint_timestamp': result['checkpoint_timestamp'],
+                'is_valid_validator_signature': result['is_valid_validator_signature'],
+                'signing_validator_count': result['signing_validator_count'],
+                'signing_power_percentage': result['signing_power_percentage'],
+                'layer_snapshot_exists': result['layer_snapshot_exists'],
+                'signature_valid': result['signature_valid'],
+                'validation_status': result['status'],
+                'error_message': result['error_details']
+            }
+            
+            self.db.insert_attestation_validation_result(data)
+            logger.info(f"Saved attestation validation result for tx {result['tx_hash']}")
+            
         except Exception as e:
-            logger.error(f"Failed to write result: {e}")
+            logger.error(f"Failed to write validation result to database: {e}")
     
     def validate_all_attestations(self):
         """
@@ -845,6 +833,13 @@ class AttestVerifier:
             result = self.validate_attestation(attestation, checkpoints)
             self.write_result(result)
             
+            # update state after each successful validation
+            state['last_tx_hash'] = attestation['tx_hash']
+            state['last_block_number'] = attestation['block_number']
+            state['total_validations'] = state.get('total_validations', 0) + 1
+            state['last_validation_timestamp'] = datetime.utcnow().isoformat()
+            self.save_validation_state(state)
+            
             # track statistics
             if result['status'] == 'VALID':
                 valid_count += 1
@@ -859,13 +854,6 @@ class AttestVerifier:
             
             processed_count += 1
             
-            # update state after each successful validation
-            state["last_tx_hash"] = attestation["tx_hash"]
-            state["last_block_number"] = attestation["block_number"]
-            state["total_validations"] = state["total_validations"] + 1
-            state["last_validation_timestamp"] = datetime.utcnow().isoformat()
-            self.save_validation_state(state)
-            
             # small delay to avoid overwhelming services
             time.sleep(0.1)
         
@@ -877,8 +865,7 @@ class AttestVerifier:
         logger.info(f"  🔒 Invalid signatures: {invalid_signature_count}")
         logger.info(f"  ❌ Errors: {error_count}")
         logger.info(f"  📈 Total validations: {state['total_validations']}")
-        logger.info(f"Results saved to: {self.results_file}")
-        logger.info(f"State saved to: {self.state_file}")
+        logger.info(f"Results saved to: {self.validation_csv_file}")
         
         if malicious_count > 0:
             logger.warning(f"🚨 {malicious_count} malicious attestations detected from valid validators!")
