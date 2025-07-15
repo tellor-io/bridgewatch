@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Watcher - Unified Bridge Data Monitor
+Bridge Watcher - Enhanced Unified Bridge Data Monitor
 
 This script orchestrates all bridge monitoring and validation components:
 1. checkpoint_scribe - collect bridge validator sets and checkpoints from Layer
@@ -8,6 +8,8 @@ This script orchestrates all bridge monitoring and validation components:
 3. attest_watcher - monitor attestations in evm data bridge contract
 4. valset_verifier - validate valset updates in bridge contract against Layer
 5. attest_verifier - validate attestations in bridge contract against Layer
+
+Enhanced with database lock conflict handling and graceful degradation.
 
 Usage:
     bridgewatch start [--once] [--interval 300]
@@ -36,11 +38,13 @@ from valset_verifier import ValsetVerifier
 from attest_verifier import AttestVerifier
 from config import config, get_config_manager
 from database_cli import DATABASE_COMMANDS
+from database_manager import DatabaseLockError
 
 class BridgeWatcher:
-    def __init__(self, min_height: Optional[int] = None):
+    def __init__(self, min_height: Optional[int] = None, disable_discord: bool = False):
         self.running = False
         self.min_height = min_height
+        self.disable_discord = disable_discord
         
         # get config manager for directory paths
         try:
@@ -79,12 +83,14 @@ class BridgeWatcher:
         self.valset_verifier = ValsetVerifier(
             layer_rpc_url=config.get_layer_rpc_url(),
             evm_rpc_url=config.get_evm_rpc_url(),
-            chain_id=config.get_chain_id()
+            chain_id=config.get_chain_id(),
+            disable_discord=disable_discord
         )
         
         self.attest_verifier = AttestVerifier(
             layer_rpc_url=config.get_layer_rpc_url(),
-            chain_id=config.get_chain_id()
+            chain_id=config.get_chain_id(),
+            disable_discord=disable_discord
         )
         
         # setup signal handlers for graceful shutdown
@@ -97,6 +103,32 @@ class BridgeWatcher:
         """Handle shutdown signals gracefully"""
         logger.info(f"Received signal {signum}, shutting down gracefully...")
         self.running = False
+    
+    def run_component_with_lock_handling(self, component_name: str, component_func, *args, **kwargs):
+        """Run a component with database lock error handling"""
+        max_retries = 3
+        base_delay = 5.0
+        
+        for attempt in range(max_retries):
+            try:
+                result = component_func(*args, **kwargs)
+                return result, True  # success
+                
+            except DatabaseLockError as e:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(f"{component_name}: Database locked, retrying in {delay}s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(delay)
+                    continue
+                else:
+                    logger.error(f"{component_name}: Failed after {max_retries} attempts due to database locks")
+                    return None, False  # failed after all retries
+                    
+            except Exception as e:
+                logger.error(f"{component_name}: Unexpected error: {e}")
+                return None, False  # failed with other error
+        
+        return None, False  # shouldn't reach here
     
     def load_watcher_state(self) -> Dict[str, Any]:
         """Load overall watcher state"""
@@ -123,63 +155,110 @@ class BridgeWatcher:
     
     def run_single_cycle(self) -> bool:
         """
-        Run one complete monitoring cycle
+        Run one complete monitoring cycle with lock handling
         Returns True if successful, False if error
         """
         cycle_start = datetime.utcnow()
         logger.info("=" * 60)
-        logger.info(f"Starting bridge monitoring cycle at {cycle_start.isoformat()}")
+        logger.info(f"Starting enhanced bridge monitoring cycle at {cycle_start.isoformat()}")
         logger.info("=" * 60)
         
-        try:
-            # step 1: collect Layer checkpoints (foundation data)
-            logger.info("🔍 Step 1/5: Collecting Layer checkpoints...")
-            checkpoint_state = self.checkpoint_scribe.run_monitoring_cycle()
+        cycle_success = True
+        component_results = {}
+        
+        # Step 1: Collect Layer checkpoints (foundation data)
+        logger.info("🔍 Step 1/5: Collecting Layer checkpoints...")
+        checkpoint_state, success = self.run_component_with_lock_handling(
+            "CheckpointScribe", 
+            self.checkpoint_scribe.run_monitoring_cycle
+        )
+        
+        if success:
             checkpoint_count = checkpoint_state.get('total_checkpoints_found', 0) if checkpoint_state else 0
             logger.info(f"✅ Checkpoint collection complete. Total: {checkpoint_count}")
-            
-            # step 2: monitor validator set updates
-            logger.info("🔍 Step 2/5: Monitoring validator set updates...")
-            valset_state = self.valset_watcher.run_monitoring_cycle()
+            component_results['checkpoints'] = checkpoint_count
+        else:
+            logger.warning("⚠️  Checkpoint collection failed, continuing with other components")
+            cycle_success = False
+            component_results['checkpoints'] = 'failed'
+        
+        # Step 2: Monitor validator set updates
+        logger.info("🔍 Step 2/5: Monitoring validator set updates...")
+        valset_state, success = self.run_component_with_lock_handling(
+            "ValsetWatcher",
+            self.valset_watcher.run_monitoring_cycle
+        )
+        
+        if success:
             valset_count = valset_state.get('total_events_found', 0) if valset_state else 0
             logger.info(f"✅ Valset monitoring complete. Total: {valset_count}")
-            
-            # step 3: monitor attestations  
-            logger.info("🔍 Step 3/5: Monitoring attestations...")
-            attestation_state = self.attest_watcher.run_monitoring_cycle()
+            component_results['valset_updates'] = valset_count
+        else:
+            logger.warning("⚠️  Valset monitoring failed, continuing with other components")
+            cycle_success = False
+            component_results['valset_updates'] = 'failed'
+        
+        # Step 3: Monitor attestations  
+        logger.info("🔍 Step 3/5: Monitoring attestations...")
+        attestation_state, success = self.run_component_with_lock_handling(
+            "AttestWatcher",
+            self.attest_watcher.run_monitoring_cycle
+        )
+        
+        if success:
             attestation_count = attestation_state.get('total_calls_found', 0) if attestation_state else 0
             logger.info(f"✅ Attestation monitoring complete. Total: {attestation_count}")
-            
-            # step 4: validate validator set updates
-            logger.info("🔍 Step 4/5: Validating validator set updates...")
-            valset_validation_state = self.valset_verifier.validate_all_valset_updates()
+            component_results['attestations'] = attestation_count
+        else:
+            logger.warning("⚠️  Attestation monitoring failed, continuing with other components")
+            cycle_success = False
+            component_results['attestations'] = 'failed'
+        
+        # Step 4: Validate validator set updates
+        logger.info("🔍 Step 4/5: Validating validator set updates...")
+        valset_validation_state, success = self.run_component_with_lock_handling(
+            "ValsetVerifier",
+            self.valset_verifier.validate_all_valset_updates
+        )
+        
+        if success:
             valset_validation_count = valset_validation_state.get('total_validations', 0) if valset_validation_state else 0
             logger.info(f"✅ Valset validation complete. Total: {valset_validation_count}")
-            
-            # step 5: validate attestations
-            logger.info("🔍 Step 5/5: Validating attestations...")
-            attestation_validation_state = self.attest_verifier.validate_all_attestations()
+            component_results['valset_validation'] = valset_validation_count
+        else:
+            logger.warning("⚠️  Valset validation failed, continuing with other components")
+            cycle_success = False
+            component_results['valset_validation'] = 'failed'
+        
+        # Step 5: Validate attestations
+        logger.info("🔍 Step 5/5: Validating attestations...")
+        attestation_validation_state, success = self.run_component_with_lock_handling(
+            "AttestVerifier",
+            self.attest_verifier.validate_all_attestations
+        )
+        
+        if success:
             attestation_validation_count = attestation_validation_state.get('total_validations', 0) if attestation_validation_state else 0
             logger.info(f"✅ Attestation validation complete. Total: {attestation_validation_count}")
-            
-            cycle_end = datetime.utcnow()
-            cycle_duration = (cycle_end - cycle_start).total_seconds()
-            
-            logger.info("=" * 60)
+            component_results['attestation_validation'] = attestation_validation_count
+        else:
+            logger.warning("⚠️  Attestation validation failed")
+            cycle_success = False
+            component_results['attestation_validation'] = 'failed'
+        
+        cycle_end = datetime.utcnow()
+        cycle_duration = (cycle_end - cycle_start).total_seconds()
+        
+        logger.info("=" * 60)
+        if cycle_success:
             logger.info(f"✅ Bridge monitoring cycle completed successfully in {cycle_duration:.1f}s")
-            logger.info("=" * 60)
-            
-            return True
-            
-        except Exception as e:
-            cycle_end = datetime.utcnow()
-            cycle_duration = (cycle_end - cycle_start).total_seconds()
-            
-            logger.error("=" * 60)
-            logger.error(f"❌ Bridge monitoring cycle failed after {cycle_duration:.1f}s: {e}")
-            logger.error("=" * 60)
-            
-            return False
+        else:
+            logger.warning(f"⚠️  Bridge monitoring cycle completed with some failures in {cycle_duration:.1f}s")
+        
+        logger.info(f"📊 Component Results: {component_results}")
+        logger.info("=" * 60)
+        
+        return cycle_success
     
     def run_continuous(self, interval_seconds: int = 300):
         """Run continuous monitoring with specified interval"""
@@ -412,6 +491,7 @@ Examples:
     start_parser.add_argument('--min-height', type=int, help='Minimum block height to start scraping from (EVM chains)')
     start_parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     start_parser.add_argument('--no-color', action='store_true', help='Disable colored output')
+    start_parser.add_argument('--no-discord', action='store_true', help='Disable Discord alerts')
     
     # status command
     status_parser = subparsers.add_parser('status', help='Show current status')
@@ -469,6 +549,7 @@ Examples:
     valset_alerts_parser.add_argument('--interval', type=int, default=60, help='Check interval in seconds (default: 60)')
     valset_alerts_parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     valset_alerts_parser.add_argument('--no-color', action='store_true', help='Disable colored output')
+    valset_alerts_parser.add_argument('--no-discord', action='store_true', help='Disable Discord alerts')
     
     args = parser.parse_args()
     
@@ -488,7 +569,11 @@ Examples:
     
     try:
         if args.command == 'start':
-            watcher = BridgeWatcher(min_height=args.min_height)
+            # log warning if Discord is disabled
+            if getattr(args, 'no_discord', False):
+                logger.warning("⚠️  Discord alerts are DISABLED via --no-discord flag")
+            
+            watcher = BridgeWatcher(min_height=args.min_height, disable_discord=getattr(args, 'no_discord', False))
             if args.once:
                 watcher.run_once()
             else:
@@ -643,10 +728,14 @@ Examples:
         elif args.command == 'valset-alerts':
             from valset_alerter import ValsetAlerter
             
+            # log warning if Discord is disabled
+            if getattr(args, 'no_discord', False):
+                logger.warning("⚠️  Discord alerts are DISABLED via --no-discord flag")
+            
             logger.info("🔔 Starting Valset Alerter...")
             
             try:
-                alerter = ValsetAlerter()
+                alerter = ValsetAlerter(disable_discord=getattr(args, 'no_discord', False))
                 
                 if args.once:
                     alerts_sent = alerter.run_once()

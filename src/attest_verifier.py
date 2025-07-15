@@ -47,10 +47,11 @@ BACKOFF_MULTIPLIER = 2
 MAX_RETRIES = 6    # number of exponential backoff attempts
 
 class AttestVerifier:
-    def __init__(self, layer_rpc_url: str, chain_id: str, output_prefix: str = "attestation_validation_results"):
+    def __init__(self, layer_rpc_url: str, chain_id: str, output_prefix: str = "attestation_validation_results", disable_discord: bool = False):
         self.layer_rpc_url = layer_rpc_url.rstrip('/')
         self.chain_id = chain_id
         self.output_prefix = output_prefix
+        self.disable_discord = disable_discord
         
         self.w3 = Web3()  # for ABI decoding only
         
@@ -78,12 +79,16 @@ class AttestVerifier:
         # initialize database schema if needed
         self.db.init_database()
         
-        # discord webhook URL (from environment variable)
-        self.discord_webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
-        if self.discord_webhook_url:
-            logger.info("Discord alerts enabled")
+        # discord webhook URL (from environment variable, unless disabled)
+        if self.disable_discord:
+            self.discord_webhook_url = None
+            logger.warning("Discord alerts: DISABLED via --no-discord flag")
         else:
-            logger.info("Discord alerts disabled (DISCORD_WEBHOOK_URL not set)")
+            self.discord_webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
+            if self.discord_webhook_url:
+                logger.info("Discord alerts enabled")
+            else:
+                logger.info("Discord alerts disabled (DISCORD_WEBHOOK_URL not set)")
     
     def test_connection(self):
         """Test connection to Layer RPC"""
@@ -341,6 +346,10 @@ class AttestVerifier:
         """
         Send Discord alert for malicious attestations from valid validators
         """
+        if self.disable_discord:
+            logger.debug("Discord alerts disabled via --no-discord flag, skipping alert")
+            return
+            
         if not self.discord_webhook_url:
             logger.debug("Discord webhook URL not configured, skipping alert")
             return

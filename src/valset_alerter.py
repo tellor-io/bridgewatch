@@ -11,9 +11,9 @@ Features:
 - Converts timestamps to US Eastern timezone  
 - Looks up Ethereum block timestamps
 - Maintains state for resuming from last processed update
+- Handles database lock conflicts gracefully
 """
 
-import json
 import time
 import requests
 import logging
@@ -22,13 +22,18 @@ from typing import Dict, Any, List, Optional
 from web3 import Web3
 import pytz
 from config_manager import get_config_manager
+import random
 
 # configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+class DatabaseLockError(Exception):
+    """Raised when database is locked by another process"""
+    pass
+
 class ValsetAlerter:
-    def __init__(self):
+    def __init__(self, disable_discord: bool = False):
         """Initialize the valset alerter"""
         try:
             self.config_manager = get_config_manager()
@@ -40,8 +45,11 @@ class ValsetAlerter:
             self.layer_chain = self.config_manager.get_layer_chain()
             self.evm_chain = self.config_manager.get_evm_chain()
             
-            # get Discord webhook for valset updates
-            self.discord_webhook_url = self.get_valset_discord_webhook()
+            # store disable_discord flag
+            self.disable_discord = disable_discord
+            
+            # get Discord webhook for valset updates (unless disabled)
+            self.discord_webhook_url = None if disable_discord else self.get_valset_discord_webhook()
             
             # initialize Web3 for block timestamp lookups
             self.w3 = Web3(Web3.HTTPProvider(self.evm_rpc_url))
@@ -53,11 +61,25 @@ class ValsetAlerter:
             
             logger.info(f"Initialized ValsetAlerter for {self.layer_chain} → {self.evm_chain}")
             logger.info(f"Bridge contract: {self.bridge_contract}")
-            logger.info(f"Discord alerts: {'enabled' if self.discord_webhook_url else 'disabled'}")
+            
+            if self.disable_discord:
+                logger.warning("Discord alerts: DISABLED via --no-discord flag")
+            else:
+                logger.info(f"Discord alerts: {'enabled' if self.discord_webhook_url else 'disabled'}")
             
         except Exception as e:
             logger.error(f"Failed to initialize ValsetAlerter: {e}")
             raise
+    
+    def is_database_lock_error(self, error: Exception) -> bool:
+        """Check if error is a DuckDB lock conflict"""
+        error_str = str(error).lower()
+        return (
+            "could not set lock on file" in error_str or
+            "conflicting lock is held" in error_str or
+            "database is locked" in error_str or
+            "io error" in error_str and "lock" in error_str
+        )
     
     def get_valset_discord_webhook(self) -> Optional[str]:
         """Get the Discord webhook URL for valset updates"""
@@ -98,13 +120,17 @@ class ValsetAlerter:
                     "last_alert_timestamp": None
                 }
         except Exception as e:
-            logger.warning(f"Could not load alerter state from database: {e}")
-            return {
-                "last_tx_hash": None,
-                "last_block_number": 0,
-                "total_alerts_sent": 0,
-                "last_alert_timestamp": None
-            }
+            if self.is_database_lock_error(e):
+                logger.warning(f"Database is locked by another process: {e}")
+                raise DatabaseLockError(f"Database locked: {e}")
+            else:
+                logger.warning(f"Could not load alerter state from database: {e}")
+                return {
+                    "last_tx_hash": None,
+                    "last_block_number": 0,
+                    "total_alerts_sent": 0,
+                    "last_alert_timestamp": None
+                }
     
     def save_alerter_state(self, state: Dict[str, Any]):
         """Save alerter state to database"""
@@ -112,7 +138,12 @@ class ValsetAlerter:
             self.db.save_component_state('valset_alerter', state)
             logger.debug(f"Saved alerter state to database: {state}")
         except Exception as e:
-            logger.error(f"Could not save alerter state to database: {e}")
+            if self.is_database_lock_error(e):
+                logger.warning(f"Could not save alerter state due to database lock: {e}")
+                raise DatabaseLockError(f"Database locked while saving state: {e}")
+            else:
+                logger.error(f"Could not save alerter state to database: {e}")
+                raise
     
     def get_new_valset_updates(self, state: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Get new validator set updates since last alert"""
@@ -145,8 +176,12 @@ class ValsetAlerter:
                 return all_updates
                 
         except Exception as e:
-            logger.error(f"Failed to get valset updates from database: {e}")
-            return []
+            if self.is_database_lock_error(e):
+                logger.warning(f"Database is locked by another process: {e}")
+                raise DatabaseLockError(f"Database locked while getting valset updates: {e}")
+            else:
+                logger.error(f"Failed to get valset updates from database: {e}")
+                return []
     
     def get_ethereum_block_timestamp(self, block_number: int) -> Optional[datetime]:
         """Get timestamp of an Ethereum block"""
@@ -173,6 +208,10 @@ class ValsetAlerter:
     
     def send_valset_alert(self, update: Dict[str, Any]) -> bool:
         """Send Discord alert for a validator set update"""
+        if self.disable_discord:
+            logger.debug("Discord alerts disabled via --no-discord flag, skipping alert")
+            return False
+            
         if not self.discord_webhook_url:
             logger.debug("No Discord webhook configured, skipping alert")
             return False
@@ -245,11 +284,16 @@ class ValsetAlerter:
         """Run once and process all new valset updates"""
         logger.info("Starting valset alerter (run once)")
         
-        # load state
-        state = self.load_alerter_state()
-        
-        # get new updates
-        new_updates = self.get_new_valset_updates(state)
+        try:
+            # load state - will raise DatabaseLockError if database is locked
+            state = self.load_alerter_state()
+            
+            # get new updates - will raise DatabaseLockError if database is locked  
+            new_updates = self.get_new_valset_updates(state)
+            
+        except DatabaseLockError as e:
+            logger.warning(f"Skipping cycle due to database lock: {e}")
+            return -1  # special return code indicating database lock
         
         if not new_updates:
             logger.info("No new valset updates to alert on")
@@ -270,7 +314,12 @@ class ValsetAlerter:
             state['last_block_number'] = update['block_number']
             state['total_alerts_sent'] = state.get('total_alerts_sent', 0) + 1
             state['last_alert_timestamp'] = datetime.utcnow().isoformat()
-            self.save_alerter_state(state)
+            
+            try:
+                self.save_alerter_state(state)
+            except DatabaseLockError as e:
+                logger.warning(f"Could not save state after alert due to database lock: {e}")
+                # continue processing but state won't be saved until next successful save
             
             # small delay between alerts
             time.sleep(1)
@@ -284,13 +333,30 @@ class ValsetAlerter:
         """Run continuously, checking for new updates every interval"""
         logger.info(f"Starting valset alerter (continuous mode, interval: {interval_seconds}s)")
         
+        consecutive_lock_errors = 0
+        base_backoff_sleep = 5
+        
         while True:
             try:
                 alerts_sent = self.run_once()
-                if alerts_sent > 0:
-                    logger.info(f"Cycle complete: sent {alerts_sent} alerts")
+                
+                if alerts_sent == -1:  # database lock error
+                    consecutive_lock_errors += 1
+                    # exponential backoff for lock errors, but cap at 5 minutes
+                    sleep_time = min(base_backoff_sleep * (2 ** (consecutive_lock_errors - 1)), 300)
+                    # add a random jitter to the sleep time so we don't all retry at the same time
+                    sleep_time = sleep_time * (1 + random.uniform(-0.1, 0.1))
+                    logger.info(f"Database locked ({consecutive_lock_errors} consecutive), retrying in {sleep_time}s...")
+                    time.sleep(sleep_time)
+                    continue
                 else:
-                    logger.debug("Cycle complete: no new updates")
+                    # reset lock error counter on successful run
+                    consecutive_lock_errors = 0
+                    
+                    if alerts_sent > 0:
+                        logger.info(f"Cycle complete: sent {alerts_sent} alerts")
+                    else:
+                        logger.debug("Cycle complete: no new updates")
                 
                 logger.info(f"Sleeping for {interval_seconds} seconds...")
                 time.sleep(interval_seconds)
@@ -300,6 +366,7 @@ class ValsetAlerter:
                 break
             except Exception as e:
                 logger.error(f"Error in continuous loop: {e}")
+                consecutive_lock_errors = 0  # reset since this isn't a lock error
                 logger.info(f"Retrying in {interval_seconds} seconds...")
                 time.sleep(interval_seconds)
 
@@ -316,18 +383,27 @@ def main():
     parser.add_argument('--interval', type=int, default=60, 
                        help='Check interval in seconds for continuous mode (default: 60)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
+    parser.add_argument('--no-discord', action='store_true', help='Disable Discord alerts')
     
     args = parser.parse_args()
     
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
+    # log warning if Discord is disabled
+    if args.no_discord:
+        logger.warning("⚠️  Discord alerts are DISABLED via --no-discord flag")
+    
     try:
-        alerter = ValsetAlerter()
+        alerter = ValsetAlerter(disable_discord=args.no_discord)
         
         if args.once:
             alerts_sent = alerter.run_once()
-            print(f"Sent {alerts_sent} alerts")
+            if alerts_sent == -1:
+                print("Skipped due to database lock")
+                exit(2)
+            else:
+                print(f"Sent {alerts_sent} alerts")
         else:
             alerter.run_continuous(args.interval)
             

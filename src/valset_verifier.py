@@ -42,10 +42,11 @@ MAX_RETRIES = config.get_max_retries()
 RETRY_DELAY = config.get_retry_delay()
 
 class ValsetVerifier:
-    def __init__(self, layer_rpc_url: str, evm_rpc_url: str, chain_id: str):
+    def __init__(self, layer_rpc_url: str, evm_rpc_url: str, chain_id: str, disable_discord: bool = False):
         self.layer_rpc_url = layer_rpc_url.rstrip('/')
         self.evm_rpc_url = evm_rpc_url
         self.chain_id = chain_id
+        self.disable_discord = disable_discord
         self.w3 = Web3(Web3.HTTPProvider(evm_rpc_url))
         
         # test connection
@@ -59,8 +60,12 @@ class ValsetVerifier:
             self.checkpoint_dir = config_manager.get_layer_checkpoints_dir()
             self.valset_dir = config_manager.get_valset_dir()
             
-            # get Discord webhook URL from config
-            self.discord_webhook_url = config_manager.get_discord_webhook_url()
+            # get Discord webhook URL from config (unless disabled)
+            if self.disable_discord:
+                self.discord_webhook_url = None
+                logger.warning("Discord alerts: DISABLED via --no-discord flag")
+            else:
+                self.discord_webhook_url = config_manager.get_discord_webhook_url()
             
             # initialize database connection
             self.db = config_manager.create_database_manager()
@@ -70,7 +75,13 @@ class ValsetVerifier:
             self.data_dir = f"data/validation"
             self.checkpoint_dir = f"data/layer_checkpoints"
             self.valset_dir = f"data/valset"
-            self.discord_webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
+            
+            if self.disable_discord:
+                self.discord_webhook_url = None
+                logger.warning("Discord alerts: DISABLED via --no-discord flag")
+            else:
+                self.discord_webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
+            
             self.db = None
         
         # create data directory
@@ -901,6 +912,10 @@ class ValsetVerifier:
 
     def send_discord_alert(self, alert_type: str, details: Dict[str, Any]):
         """Send Discord alert for malicious validator set signatures"""
+        if self.disable_discord:
+            logger.debug("Discord alerts disabled via --no-discord flag, skipping alert")
+            return
+            
         if not self.discord_webhook_url:
             logger.debug("No Discord webhook URL configured, skipping alert")
             return
