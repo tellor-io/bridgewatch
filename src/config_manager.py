@@ -29,11 +29,12 @@ except Exception as e:
 class ConfigManager:
     """Advanced configuration manager supporting multiple bridge configurations"""
     
-    def __init__(self, config_file: Optional[str] = None):
+    def __init__(self, config_file: Optional[str] = None, config_name_override: Optional[str] = None):
         self.config_file = config_file or "config.json"
         self._config_data = None
         self._active_config_name = None
         self._active_config = None
+        self._config_name_override = config_name_override
         self._load_config()
         self._load_active_config()
     
@@ -66,8 +67,13 @@ class ConfigManager:
         return re.sub(pattern, replace_var, content)
     
     def _load_active_config(self):
-        """Load the active configuration based on ACTIVE_CONFIG env var"""
-        self._active_config_name = os.getenv('ACTIVE_CONFIG')
+        """Load the active configuration based on override, ACTIVE_CONFIG env var, or default"""
+        # check for config name override first (from CLI flag)
+        if self._config_name_override:
+            self._active_config_name = self._config_name_override
+        else:
+            # fallback to environment variable
+            self._active_config_name = os.getenv('ACTIVE_CONFIG')
         
         if not self._active_config_name:
             # try to use the first available config as default
@@ -348,3 +354,10 @@ def get_config_manager() -> ConfigManager:
         _config_manager_instance = ConfigManager()
     
     return _config_manager_instance
+
+def reset_config_manager_instance(config_name_override: Optional[str] = None):
+    """
+    Reset the global configuration manager instance with optional config override
+    """
+    global _config_manager_instance
+    _config_manager_instance = ConfigManager(config_name_override=config_name_override)

@@ -355,8 +355,15 @@ def main():
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     parser.add_argument('--no-color', action='store_true', help='Disable colored output')
     parser.add_argument('--no-discord', action='store_true', help='Disable Discord alerts')
+    parser.add_argument('--config', type=str, help='Specify which configuration profile to use (overrides ACTIVE_CONFIG)')
     
     args = parser.parse_args()
+    
+    # set config override if --config flag was provided
+    if args.config:
+        from config import set_global_config_override
+        set_global_config_override(args.config)
+        print(f"Using configuration: {args.config}")
     
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
