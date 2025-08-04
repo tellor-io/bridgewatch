@@ -268,10 +268,7 @@ class BridgeWatcher:
         # show configuration information
         try:
             config_manager = get_config_manager()
-            if not config_manager._legacy_mode:
-                logger.info(f"📋 Active Config: {config_manager.get_active_config_name()}")
-            else:
-                logger.info("📋 Active Config: Legacy Mode")
+            logger.info(f"📋 Active Config: {config_manager.get_active_config_name()}")
         except RuntimeError:
             logger.info("📋 Active Config: Legacy Mode")
             
