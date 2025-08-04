@@ -35,9 +35,9 @@ class Config:
     Backward-compatible configuration wrapper using ConfigManager
     """
     
-    def __init__(self, config_file: Optional[str] = None):
+    def __init__(self, config_file: Optional[str] = None, config_name_override: Optional[str] = None):
         try:
-            self.config_manager = ConfigManager(config_file)
+            self.config_manager = ConfigManager(config_file, config_name_override)
         except Exception as e:
             # fallback to old behavior if new config fails
             print(f"Warning: Could not load new config format: {e}")
@@ -214,6 +214,15 @@ class Config:
 
 # Global config instance
 config = Config()
+
+def set_global_config_override(config_name_override: Optional[str]):
+    """Set global config override - useful for CLI applications"""
+    global config
+    config = Config(config_name_override=config_name_override)
+    
+    # also reset the global config manager instance so it uses the new config
+    from config_manager import reset_config_manager_instance
+    reset_config_manager_instance(config_name_override)
 
 # Convenience functions for backward compatibility
 def get_evm_rpc_url() -> str:

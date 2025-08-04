@@ -36,7 +36,8 @@ from valset_watcher import ValsetWatcher
 from attest_watcher import AttestWatcher
 from valset_verifier import ValsetVerifier
 from attest_verifier import AttestVerifier
-from config import config, get_config_manager
+import config as config_module
+from config import get_config_manager
 from database_cli import DATABASE_COMMANDS
 from database_manager import DatabaseLockError
 
@@ -59,37 +60,37 @@ class BridgeWatcher:
         # create main data directory
         os.makedirs(data_dir, exist_ok=True)
         
-        # initialize components using config system
+        # initialize components using config system (get current config dynamically)
         self.checkpoint_scribe = CheckpointScribe(
-            layer_rpc_url=config.get_layer_rpc_url(),
-            chain_id=config.get_chain_id(),
+            layer_rpc_url=config_module.config.get_layer_rpc_url(),
+            chain_id=config_module.config.get_chain_id(),
             output_prefix='checkpoints'
         )
         
         self.valset_watcher = ValsetWatcher(
-            provider_url=config.get_evm_rpc_url(),
-            bridge_address=config.get_bridge_address(),
+            provider_url=config_module.config.get_evm_rpc_url(),
+            bridge_address=config_module.config.get_bridge_address(),
             output_prefix='valset_updates',
             min_height=min_height
         )
         
         self.attest_watcher = AttestWatcher(
-            provider_url=config.get_evm_rpc_url(),
-            bridge_address=config.get_bridge_address(),
+            provider_url=config_module.config.get_evm_rpc_url(),
+            bridge_address=config_module.config.get_bridge_address(),
             output_prefix='attestations',
             min_height=min_height
         )
         
         self.valset_verifier = ValsetVerifier(
-            layer_rpc_url=config.get_layer_rpc_url(),
-            evm_rpc_url=config.get_evm_rpc_url(),
-            chain_id=config.get_chain_id(),
+            layer_rpc_url=config_module.config.get_layer_rpc_url(),
+            evm_rpc_url=config_module.config.get_evm_rpc_url(),
+            chain_id=config_module.config.get_chain_id(),
             disable_discord=disable_discord
         )
         
         self.attest_verifier = AttestVerifier(
-            layer_rpc_url=config.get_layer_rpc_url(),
-            chain_id=config.get_chain_id(),
+            layer_rpc_url=config_module.config.get_layer_rpc_url(),
+            chain_id=config_module.config.get_chain_id(),
             disable_discord=disable_discord
         )
         
@@ -267,15 +268,17 @@ class BridgeWatcher:
         # show configuration information
         try:
             config_manager = get_config_manager()
-            logger.info(f"📋 Active Config: {config_manager.get_display_name()}")
-            logger.info(f"📂 Data Directory: {config_manager.get_data_dir()}")
+            if not config_manager._legacy_mode:
+                logger.info(f"📋 Active Config: {config_manager.get_active_config_name()}")
+            else:
+                logger.info("📋 Active Config: Legacy Mode")
         except RuntimeError:
             logger.info("📋 Active Config: Legacy Mode")
-        
-        logger.info(f"📍 Layer RPC: {config.get_layer_rpc_url()}")
-        logger.info(f"📍 EVM RPC: {config.get_evm_rpc_url()}")
-        logger.info(f"📍 Bridge Address: {config.get_bridge_address()}")
-        logger.info(f"📍 Chain ID: {config.get_chain_id()}")
+            
+        logger.info(f"📍 Layer RPC: {config_module.config.get_layer_rpc_url()}")
+        logger.info(f"📍 EVM RPC: {config_module.config.get_evm_rpc_url()}")
+        logger.info(f"📍 Bridge Address: {config_module.config.get_bridge_address()}")
+        logger.info(f"📍 Chain ID: {config_module.config.get_chain_id()}")
         
         if self.min_height is not None:
             logger.info(f"⬆️  Min Height: {self.min_height} (will override saved state if higher)")
@@ -422,7 +425,7 @@ class BridgeWatcher:
             validation_dir = "data/validation"
             bridge_state_file = "data/bridge_watcher_state.json"
         
-        chain_id = config.get_chain_id()
+        chain_id = config_module.config.get_chain_id()
         state_files = [
             bridge_state_file,
             f"{checkpoint_dir}/{chain_id}_checkpoints_state.json",
@@ -449,10 +452,10 @@ def load_config() -> Dict[str, Any]:
     """Load configuration from environment or defaults (deprecated - use config module instead)"""
     logger.warning("load_config() is deprecated, components should use config module directly")
     return {
-        'layer_rpc_url': config.get_layer_rpc_url(),
-        'evm_rpc_url': config.get_evm_rpc_url(),
-        'bridge_address': config.get_bridge_address(),
-        'chain_id': config.get_chain_id()
+        'layer_rpc_url': config_module.config.get_layer_rpc_url(),
+        'evm_rpc_url': config_module.config.get_evm_rpc_url(),
+        'bridge_address': config_module.config.get_bridge_address(),
+        'chain_id': config_module.config.get_chain_id()
     }
 
 def main():
@@ -467,6 +470,7 @@ Examples:
   bridgewatch start --min-height 8500000   # start scraping from block 8500000
   bridgewatch start --verbose              # start with verbose colored logging
   bridgewatch --verbose start        # verbose flag works globally too
+  bridgewatch --config layertest-4-sepolia-bridge start  # use specific config
   bridgewatch status --no-color      # show status without colors
   bridgewatch reset                  # reset all progress
   bridgewatch test-discord           # test Discord webhook alerts
@@ -475,12 +479,14 @@ Examples:
   bridgewatch config switch <name>   # switch to different configuration
   bridgewatch config validate        # validate current configuration
   bridgewatch valset-alerts          # monitor and alert on validator set updates
+  bridgewatch valset-alerts --config tellor-1-sagaevm-bridge  # run with specific config
         """
     )
     
-    # add global verbose flag
+    # add global flags
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     parser.add_argument('--no-color', action='store_true', help='Disable colored output')
+    parser.add_argument('--config', type=str, help='Specify which configuration profile to use (overrides ACTIVE_CONFIG)')
     
     subparsers = parser.add_subparsers(dest='command', help='Commands')
     
@@ -492,26 +498,31 @@ Examples:
     start_parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     start_parser.add_argument('--no-color', action='store_true', help='Disable colored output')
     start_parser.add_argument('--no-discord', action='store_true', help='Disable Discord alerts')
+    start_parser.add_argument('--config', type=str, help='Specify which configuration profile to use (overrides ACTIVE_CONFIG)')
     
     # status command
     status_parser = subparsers.add_parser('status', help='Show current status')
     status_parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     status_parser.add_argument('--no-color', action='store_true', help='Disable colored output')
+    status_parser.add_argument('--config', type=str, help='Specify which configuration profile to use (overrides ACTIVE_CONFIG)')
     
     # reset command  
     reset_parser = subparsers.add_parser('reset', help='Reset all state files')
     reset_parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     reset_parser.add_argument('--no-color', action='store_true', help='Disable colored output')
+    reset_parser.add_argument('--config', type=str, help='Specify which configuration profile to use (overrides ACTIVE_CONFIG)')
     
     # test-discord command
     discord_parser = subparsers.add_parser('test-discord', help='Test Discord webhook')
     discord_parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     discord_parser.add_argument('--no-color', action='store_true', help='Disable colored output')
+    discord_parser.add_argument('--config', type=str, help='Specify which configuration profile to use (overrides ACTIVE_CONFIG)')
     
     # config command with subcommands
     config_parser = subparsers.add_parser('config', help='Configuration management')
     config_parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     config_parser.add_argument('--no-color', action='store_true', help='Disable colored output')
+    config_parser.add_argument('--config', type=str, help='Specify which configuration profile to use (overrides ACTIVE_CONFIG)')
     
     config_subparsers = config_parser.add_subparsers(dest='config_command', help='Config commands')
     
@@ -533,6 +544,7 @@ Examples:
     database_parser = subparsers.add_parser('database', help='Database management')
     database_parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     database_parser.add_argument('--no-color', action='store_true', help='Disable colored output')
+    database_parser.add_argument('--config', type=str, help='Specify which configuration profile to use (overrides ACTIVE_CONFIG)')
     
     database_subparsers = database_parser.add_subparsers(dest='database_command', help='Database commands')
     
@@ -550,6 +562,17 @@ Examples:
     valset_alerts_parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     valset_alerts_parser.add_argument('--no-color', action='store_true', help='Disable colored output')
     valset_alerts_parser.add_argument('--no-discord', action='store_true', help='Disable Discord alerts')
+    valset_alerts_parser.add_argument('--config', type=str, help='Specify which configuration profile to use (overrides ACTIVE_CONFIG)')
+    
+    # valset-stale-alerts command
+    valset_stale_alerts_parser = subparsers.add_parser('valset-stale-alerts', help='Monitor and alert when validator set becomes stale')
+    valset_stale_alerts_parser.add_argument('--once', action='store_true', help='Run once instead of continuously')
+    valset_stale_alerts_parser.add_argument('--interval', type=int, default=300, help='Check interval in seconds (default: 300)')
+    valset_stale_alerts_parser.add_argument('--stale-threshold', type=int, default=336, help='Hours after which validator set is considered stale (default: 336 = 2 weeks)')
+    valset_stale_alerts_parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
+    valset_stale_alerts_parser.add_argument('--no-color', action='store_true', help='Disable colored output')
+    valset_stale_alerts_parser.add_argument('--no-discord', action='store_true', help='Disable Discord alerts')
+    valset_stale_alerts_parser.add_argument('--config', type=str, help='Specify which configuration profile to use (overrides ACTIVE_CONFIG)')
     
     args = parser.parse_args()
     
@@ -557,12 +580,21 @@ Examples:
         parser.print_help()
         sys.exit(1)
     
+    # set config override if --config flag was provided
+    if hasattr(args, 'config') and args.config:
+        from config import set_global_config_override
+        set_global_config_override(args.config)
+    
     # setup colored logging based on verbose and no-color flags
     setup_logging(verbose=args.verbose, no_color=getattr(args, 'no_color', False))
     
+    # log which config we're using if override was provided
+    if hasattr(args, 'config') and args.config:
+        logger.info(f"🔧 Using configuration: {args.config}")
+    
     # validate configuration (this will raise an error if EVM_RPC_URL is missing)
     try:
-        config.get_evm_rpc_url()  # This will check if the required env var is set
+        config_module.config.get_evm_rpc_url()  # This will check if the required env var is set
     except ValueError as e:
         logger.error(f"Configuration error: {e}")
         sys.exit(1)
@@ -745,6 +777,37 @@ Examples:
                     
             except Exception as e:
                 logger.error(f"❌ Valset alerter failed: {e}")
+                sys.exit(1)
+        
+        elif args.command == 'valset-stale-alerts':
+            from valset_stale_alerter import ValsetStaleAlerter
+            
+            # log warning if Discord is disabled
+            if getattr(args, 'no_discord', False):
+                logger.warning("⚠️  Discord alerts are DISABLED via --no-discord flag")
+            
+            logger.info("⏰ Starting Valset Stale Alerter...")
+            
+            try:
+                alerter = ValsetStaleAlerter(
+                    disable_discord=getattr(args, 'no_discord', False),
+                    stale_threshold_hours=getattr(args, 'stale_threshold', 336)
+                )
+                
+                if args.once:
+                    result = alerter.run_once()
+                    if result == 1:
+                        logger.warning("🚨 Validator set is STALE")
+                    elif result == 0:
+                        logger.info("✅ Validator set is fresh")
+                    else:
+                        logger.error("❌ Error checking validator set staleness")
+                        sys.exit(1)
+                else:
+                    alerter.run_continuous(args.interval)
+                    
+            except Exception as e:
+                logger.error(f"❌ Valset stale alerter failed: {e}")
                 sys.exit(1)
             
     except Exception as e:

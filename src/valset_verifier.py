@@ -952,6 +952,19 @@ class ValsetVerifier:
             logger.error(f"Failed to send Discord alert: {e}")
 
 def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Validate valset updates")
+    parser.add_argument('--config', type=str, help='Specify which configuration profile to use (overrides ACTIVE_CONFIG)')
+    
+    args = parser.parse_args()
+    
+    # set config override if --config flag was provided
+    if args.config:
+        from config import set_global_config_override
+        set_global_config_override(args.config)
+        print(f"Using configuration: {args.config}")
+    
     verifier = ValsetVerifier(
             layer_rpc_url=config.get_layer_rpc_url(),
             evm_rpc_url=config.get_evm_rpc_url(),
