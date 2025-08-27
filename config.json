@@ -5,13 +5,15 @@
       "layer_chain": "tellor-1",
       "evm_chain": "eth-mainnet", 
       "bridge_contract": "0xFfa3393BE1E4b442fff6cD0df0794B0031e9CF65",
+      "databank_contract": "0x0000000000000000000000000000000000000000",
       "layer_rpc_url": "https://mainnet.tellorlayer.com",
       "evm_rpc_url": "${EVM_RPC_URL_MAINNET}",
       "discord_webhook_url": "${DISCORD_WEBHOOK_URL_MAINNET}",
       "discord_webhooks": {
         "malicious_activity": "${DISCORD_WEBHOOK_URL_MAINNET}",
         "valset_updates": "${DISCORD_VALSET_ALERTS_MAINNET}",
-        "valset_stale": "${DISCORD_VALSET_STALE_ALERTS_MAINNET}"
+        "valset_stale": "${DISCORD_VALSET_STALE_ALERTS_MAINNET}",
+        "feed_stale": "N/A"
       },
       "data_dir": "data/mainnet_bridge",
       "database_path": "databases/mainnet_bridge.duckdb"
@@ -21,13 +23,15 @@
       "layer_chain": "layertest-4",
       "evm_chain": "sepolia", 
       "bridge_contract": "0xC69f43741D379cE93bdaAC9b5135EA3e697df1F8",
+      "databank_contract": "0x0000000000000000000000000000000000000000",
       "layer_rpc_url": "https://node-palmito.tellorlayer.com",
       "evm_rpc_url": "${EVM_RPC_URL_SEPOLIA}",
       "discord_webhook_url": "${DISCORD_WEBHOOK_URL_SEPOLIA}",
       "discord_webhooks": {
         "malicious_activity": "${DISCORD_WEBHOOK_URL_SEPOLIA}",
         "valset_updates": "${DISCORD_VALSET_ALERTS_SEPOLIA}",
-        "valset_stale": "${DISCORD_VALSET_STALE_ALERTS_SEPOLIA}"
+        "valset_stale": "${DISCORD_VALSET_STALE_ALERTS_SEPOLIA}",
+        "feed_stale": "N/A"
       },
       "data_dir": "data/layertest-4_sepolia_bridge",
       "database_path": "databases/layertest-4_sepolia_bridge.duckdb"
@@ -37,12 +41,14 @@
       "layer_chain": "layerlocal-1",
       "evm_chain": "sepolia", 
       "bridge_contract": "0xCe12E80e297546c01319F2A856786193AA56B632",
+      "databank_contract": "0x0000000000000000000000000000000000000000",
       "layer_rpc_url": "http://localhost:1317/",
       "evm_rpc_url": "${EVM_RPC_URL_SEPOLIA}",
       "discord_webhook_url": "${DISCORD_WEBHOOK_URL_SEPOLIA}",
       "discord_webhooks": {
         "malicious_activity": "${DISCORD_WEBHOOK_URL_SEPOLIA}",
-        "valset_updates": "${DISCORD_VALSET_ALERTS_SEPOLIA}"
+        "valset_updates": "${DISCORD_VALSET_ALERTS_SEPOLIA}",
+        "feed_stale": "N/A"
       },
       "data_dir": "data/layerlocal-1_sepolia_bridge",
       "database_path": "databases/layerlocal-1_sepolia_bridge.duckdb"
@@ -52,13 +58,15 @@
       "layer_chain": "layerlocal-2",
       "evm_chain": "sepolia", 
       "bridge_contract": "0xCe12E80e297546c01319F2A856786193AA56B632",
+      "databank_contract": "0x0000000000000000000000000000000000000000",
       "layer_rpc_url": "http://localhost:1317/",
       "evm_rpc_url": "${EVM_RPC_URL_SEPOLIA}",
       "discord_webhook_url": "${DISCORD_WEBHOOK_URL_SEPOLIA}",
       "discord_webhooks": {
         "malicious_activity": "${DISCORD_WEBHOOK_URL_SEPOLIA}",
         "valset_updates": "${DISCORD_VALSET_ALERTS_SEPOLIA}",
-        "valset_stale": "${DISCORD_VALSET_STALE_ALERTS_SEPOLIA}"
+        "valset_stale": "${DISCORD_VALSET_STALE_ALERTS_SEPOLIA}",
+        "feed_stale": "N/A"
       },
       "data_dir": "data/layerlocal-2_sepolia_bridge",
       "database_path": "databases/layerlocal-2_sepolia_bridge.duckdb"
@@ -68,13 +76,15 @@
       "layer_chain": "tellor-1",
       "evm_chain": "sagaevm",
       "bridge_contract": "0x01694d2C99415b736285a6f334248330c2BCdA35",
+      "databank_contract": "${TELLOR_DATABANK_CONTRACT_SAGA}",
       "layer_rpc_url": "https://mainnet.tellorlayer.com",
       "evm_rpc_url": "https://sagaevm.jsonrpc.sagarpc.io",
       "discord_webhook_url": "${DISCORD_WEBHOOK_URL_SAGA}",
       "discord_webhooks": {
-        "malicious_activity": "${DISCORD_WEBHOOK_URL_SAGA}",
-        "valset_updates": "${DISCORD_VALSET_ALERTS_SAGA}",
-        "valset_stale": "${DISCORD_VALSET_STALE_ALERTS_SAGA}"
+          "malicious_activity": "${DISCORD_WEBHOOK_URL_SAGA}",
+          "valset_updates": "${DISCORD_VALSET_ALERTS_SAGA}",
+          "valset_stale": "${DISCORD_VALSET_STALE_ALERTS_SAGA}",
+          "feed_stale": "${DISCORD_FEED_STALE_SAGA}"
       },
       "data_dir": "data/tellor-1_saga_bridge",
       "database_path": "databases/tellor-1_saga_bridge.duckdb"
