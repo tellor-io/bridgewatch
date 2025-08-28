@@ -26,17 +26,20 @@ import pytz
 from pathlib import Path
 from config_manager import get_config_manager
 from logger_utils import setup_logging
+from ping_helper import PingHelper
 
 # logging will be configured in main() based on --verbose flag
 logger = logging.getLogger(__name__)
 
 class DataIntegrityMonitor:
-    def __init__(self, disable_discord: bool = False, databank_contract_address: Optional[str] = None):
+    def __init__(self, disable_discord: bool = False, databank_contract_address: Optional[str] = None,
+                 ping_frequency_days: int = 7):
         """Initialize the data integrity monitor
         
         Args:
             disable_discord: If True, skip sending Discord alerts
             databank_contract_address: Override TellorDataBank contract address
+            ping_frequency_days: Ping frequency in days (7=weekly, 1=daily, etc.)
         """
         try:
             self.config_manager = get_config_manager()
@@ -53,6 +56,7 @@ class DataIntegrityMonitor:
             
             # store settings
             self.disable_discord = disable_discord
+            self.ping_frequency_days = ping_frequency_days
             
             # initialize Web3
             self.w3 = Web3(Web3.HTTPProvider(self.evm_rpc_url))
@@ -84,6 +88,13 @@ class DataIntegrityMonitor:
             validation_dir.mkdir(parents=True, exist_ok=True)
             self.state_file = validation_dir / "data_integrity_state.json"
             self.last_checked_indices = self._load_state()
+            
+            # initialize ping helper
+            self.ping_helper = PingHelper(
+                script_name="data_integrity_monitor",
+                data_dir=data_dir,
+                discord_webhook_url=self.discord_webhook_url
+            )
             
             logger.info(f"Initialized DataIntegrityMonitor for {self.layer_chain} → {self.evm_chain}")
             logger.info(f"DataBank contract: {self.databank_contract_address}")
@@ -146,10 +157,10 @@ class DataIntegrityMonitor:
     def _get_data_integrity_discord_webhook(self) -> Optional[str]:
         """Get Discord webhook URL for data integrity alerts"""
         try:
-            # try to get from discord_webhooks configuration first
-            webhooks = self.config_manager.get_discord_webhooks()
-            if webhooks and 'malicious_activity' in webhooks:
-                return webhooks['malicious_activity']
+            # try to get specific valset_stale webhook first
+            webhook_url = self.config_manager.get_discord_webhook('malicious_activity')
+            if webhook_url and webhook_url != "N/A":
+                return webhook_url
             
             # fallback to general discord webhook
             return self.config_manager.get_discord_webhook_url()
@@ -391,6 +402,47 @@ class DataIntegrityMonitor:
         
         return violations
     
+    def generate_ping_content(self) -> str:
+        """Generate ping content with current monitoring status"""
+        try:
+            ping_content = (
+                f"**Monitoring Data Integrity:**\n"
+                f"**DataBank Contract:** `{self.databank_contract_address}`\n"
+                f"**Chain:** {self.evm_chain}\n"
+                f"**Feeds Monitored:** {len(self.feeds_config['feeds'])}\n\n"
+                f"**Last Checked Report for Each Feed:**\n"
+            )
+            
+            for feed in self.feeds_config['feeds']:
+                query_id = feed['queryId']
+                feed_name = feed['name']
+                
+                try:
+                    # get last checked index for this feed
+                    last_index = self.last_checked_indices.get(query_id, -1)
+                    
+                    if last_index >= 0:
+                        # get the data for this index to show timestamp
+                        aggregate_data = self.databank_contract.functions.getAggregateByIndex(query_id, last_index).call()
+                        aggregate_timestamp = aggregate_data[2]  # aggregateTimestamp
+                        
+                        if aggregate_timestamp > 0:
+                            formatted_time = self.ping_helper.format_timestamp_et(aggregate_timestamp)
+                            ping_content += f"**{feed_name}:** Index {last_index}, {aggregate_timestamp} ({formatted_time})\n"
+                        else:
+                            ping_content += f"**{feed_name}:** Index {last_index}, No timestamp\n"
+                    else:
+                        ping_content += f"**{feed_name}:** Not yet checked\n"
+                        
+                except Exception as e:
+                    ping_content += f"**{feed_name}:** Error getting last checked data\n"
+            
+            return ping_content
+            
+        except Exception as e:
+            logger.error(f"Failed to generate ping content: {e}")
+            return f"**Status:** Error generating ping content: {e}"
+
     def send_discord_alert(self, violation: Dict[str, Any]):
         """Send Discord alert for data integrity violation"""
         if self.disable_discord or not self.discord_webhook_url:
@@ -466,7 +518,7 @@ class DataIntegrityMonitor:
         
         return all_violations
     
-    def run_once(self) -> List[Dict[str, Any]]:
+    def run_once(self, send_ping: bool = False) -> List[Dict[str, Any]]:
         """Run data integrity check once and return results"""
         logger.info("Running data integrity check...")
         
@@ -487,9 +539,14 @@ class DataIntegrityMonitor:
         # save state after check
         self._save_state()
         
+        # check for scheduled ping
+        if self.ping_helper.should_send_ping(self.ping_frequency_days) or send_ping:
+            ping_content = self.generate_ping_content()
+            self.ping_helper.send_ping(ping_content, self.ping_frequency_days, force=send_ping)
+        
         return violations
     
-    def run_continuous(self):
+    def run_continuous(self, send_initial_ping: bool = False):
         """Run continuous monitoring with configured interval"""
         interval_minutes = self.feeds_config['monitoring_interval_minutes']
         interval_seconds = interval_minutes * 60
@@ -497,9 +554,13 @@ class DataIntegrityMonitor:
         logger.info(f"Starting continuous data integrity monitoring (interval: {interval_minutes}m)")
         
         try:
+            # First run - check if we should send initial ping
+            first_run = True
             while True:
                 try:
-                    self.run_once()
+                    send_ping_now = send_initial_ping and first_run
+                    self.run_once(send_ping=send_ping_now)
+                    first_run = False
                 except Exception as e:
                     logger.error(f"Error during monitoring cycle: {e}")
                 
@@ -518,6 +579,8 @@ def main():
     parser.add_argument('--once', action='store_true', help='Run once instead of continuously')
     parser.add_argument('--no-discord', action='store_true', help='Disable Discord alerts')
     parser.add_argument('--databank-address', type=str, help='Override TellorDataBank contract address')
+    parser.add_argument('--ping-frequency', type=int, default=7, help='Ping frequency in days (default: 7)')
+    parser.add_argument('--ping-now', action='store_true', help='Send ping immediately')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose debug logging')
     
     args = parser.parse_args()
@@ -529,17 +592,18 @@ def main():
         # initialize monitor
         monitor = DataIntegrityMonitor(
             disable_discord=args.no_discord,
-            databank_contract_address=args.databank_address
+            databank_contract_address=args.databank_address,
+            ping_frequency_days=args.ping_frequency
         )
         
         if args.once:
             # run once
-            violations = monitor.run_once()
+            violations = monitor.run_once(send_ping=args.ping_now)
             if violations:
                 exit(1)  # exit with error code if violations found
         else:
             # run continuously
-            monitor.run_continuous()
+            monitor.run_continuous(send_initial_ping=args.ping_now)
             
     except Exception as e:
         logger.error(f"Monitor failed: {e}")

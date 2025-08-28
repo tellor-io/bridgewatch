@@ -83,6 +83,8 @@ Monitors GuardedLiquityV2OracleAdaptor contracts for guardian management and pau
 - `--verbose` - Enable verbose debug logging
 - `--no-discord` - Disable Discord alerts
 - `--interval N` - Set monitoring interval in minutes
+- `--ping-frequency N` - Set ping frequency in days (default: 7 for weekly)
+- `--ping-now` - Send ping immediately regardless of schedule
 
 ## Configuration
 

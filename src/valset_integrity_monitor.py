@@ -26,17 +26,20 @@ import pytz
 from pathlib import Path
 from config_manager import get_config_manager
 from logger_utils import setup_logging
+from ping_helper import PingHelper
 
 # logging will be configured in main() based on --verbose flag
 logger = logging.getLogger(__name__)
 
 class ValsetIntegrityMonitor:
-    def __init__(self, disable_discord: bool = False, bridge_contract_address: Optional[str] = None):
+    def __init__(self, disable_discord: bool = False, bridge_contract_address: Optional[str] = None,
+                 ping_frequency_days: int = 7):
         """Initialize the validator set integrity monitor
         
         Args:
             disable_discord: If True, skip sending Discord alerts
             bridge_contract_address: Override TellorDataBridge contract address
+            ping_frequency_days: Ping frequency in days (7=weekly, 1=daily, etc.)
         """
         try:
             self.config_manager = get_config_manager()
@@ -50,6 +53,7 @@ class ValsetIntegrityMonitor:
             
             # store settings
             self.disable_discord = disable_discord
+            self.ping_frequency_days = ping_frequency_days
             
             # initialize Web3
             self.w3 = Web3(Web3.HTTPProvider(self.evm_rpc_url))
@@ -78,6 +82,13 @@ class ValsetIntegrityMonitor:
             valset_dir.mkdir(parents=True, exist_ok=True)
             self.state_file = valset_dir / "valset_integrity_state.json"
             self.last_checked_state = self._load_state()
+            
+            # initialize ping helper
+            self.ping_helper = PingHelper(
+                script_name="valset_integrity_monitor",
+                data_dir=data_dir,
+                discord_webhook_url=self.discord_webhook_url
+            )
             
             logger.info(f"Initialized ValsetIntegrityMonitor for {self.layer_chain} → {self.evm_chain}")
             logger.info(f"Bridge contract: {self.bridge_contract_address}")
@@ -116,9 +127,9 @@ class ValsetIntegrityMonitor:
         """Get Discord webhook URL for malicious activity alerts"""
         try:
             # try to get from discord_webhooks configuration first
-            webhooks = self.config_manager.get_discord_webhooks()
-            if webhooks and 'malicious_activity' in webhooks:
-                return webhooks['malicious_activity']
+            webhook_url = self.config_manager.get_discord_webhook('malicious_activity')
+            if webhook_url and webhook_url != "N/A":
+                return webhook_url
             
             # fallback to general discord webhook
             return self.config_manager.get_discord_webhook_url()
@@ -372,6 +383,31 @@ class ValsetIntegrityMonitor:
             logger.error(f"Error checking validator integrity: {e}")
             return None
     
+    def generate_ping_content(self) -> str:
+        """Generate ping content with current validator set information"""
+        try:
+            valset_info = self._get_current_validator_state()
+            if not valset_info:
+                return "**Status:** Unable to get validator set information"
+            
+            validator_timestamp = valset_info['validator_timestamp']
+            formatted_timestamp = self.ping_helper.format_timestamp_et(validator_timestamp)
+            
+            ping_content = (
+                f"**Current DataBridge Contract Validator Set:**\n"
+                f"**Bridge Contract:** `{self.bridge_contract_address}`\n"
+                f"**Validator Timestamp:** {validator_timestamp}\n"
+                f"**Human Readable:** {formatted_timestamp}\n"
+                f"**Checkpoint:** `{valset_info['validator_set_checkpoint']}`\n"
+                f"**Power Threshold:** {valset_info['power_threshold']}"
+            )
+            
+            return ping_content
+            
+        except Exception as e:
+            logger.error(f"Failed to generate ping content: {e}")
+            return f"**Status:** Error generating ping content: {e}"
+
     def send_discord_alert(self, integrity_result: Dict[str, Any]):
         """Send Discord alert for validator set integrity violations"""
         if self.disable_discord or not self.discord_webhook_url:
@@ -442,7 +478,7 @@ class ValsetIntegrityMonitor:
         except Exception as e:
             logger.error(f"Failed to send Discord alert: {e}")
     
-    def run_once(self) -> Optional[Dict[str, Any]]:
+    def run_once(self, send_ping: bool = False) -> Optional[Dict[str, Any]]:
         """Run validator set integrity check once and return results"""
         logger.info("Checking validator set integrity...")
         
@@ -457,6 +493,11 @@ class ValsetIntegrityMonitor:
                 logger.info("Validator set integrity verified")
         else:
             logger.debug("No validator set changes detected, no integrity check needed")
+        
+        # check for scheduled ping
+        if self.ping_helper.should_send_ping(self.ping_frequency_days) or send_ping:
+            ping_content = self.generate_ping_content()
+            self.ping_helper.send_ping(ping_content, self.ping_frequency_days, force=send_ping)
         
         return integrity_result
     
@@ -489,6 +530,8 @@ def main():
     parser.add_argument('--no-discord', action='store_true', help='Disable Discord alerts')
     parser.add_argument('--bridge-address', type=str, help='Override TellorDataBridge contract address')
     parser.add_argument('--interval', type=int, default=5, help='Monitoring interval in minutes (default: 5)')
+    parser.add_argument('--ping-frequency', type=int, default=7, help='Ping frequency in days (default: 7)')
+    parser.add_argument('--ping-now', action='store_true', help='Send ping immediately')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose debug logging')
     
     args = parser.parse_args()
@@ -500,12 +543,13 @@ def main():
         # initialize monitor
         monitor = ValsetIntegrityMonitor(
             disable_discord=args.no_discord,
-            bridge_contract_address=args.bridge_address
+            bridge_contract_address=args.bridge_address,
+            ping_frequency_days=args.ping_frequency
         )
         
         if args.once:
             # run once
-            integrity_result = monitor.run_once()
+            integrity_result = monitor.run_once(send_ping=args.ping_now)
             if integrity_result and integrity_result.get('violation_type'):
                 exit(1)  # exit with error code if violations detected
         else:

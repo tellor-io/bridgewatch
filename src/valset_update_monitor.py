@@ -26,17 +26,20 @@ import pytz
 from pathlib import Path
 from config_manager import get_config_manager
 from logger_utils import setup_logging
+from ping_helper import PingHelper
 
 # logging will be configured in main() based on --verbose flag
 logger = logging.getLogger(__name__)
 
 class ValsetUpdateMonitor:
-    def __init__(self, disable_discord: bool = False, bridge_contract_address: Optional[str] = None):
+    def __init__(self, disable_discord: bool = False, bridge_contract_address: Optional[str] = None,
+                 ping_frequency_days: int = 7):
         """Initialize the validator set update monitor
         
         Args:
             disable_discord: If True, skip sending Discord alerts
             bridge_contract_address: Override TellorDataBridge contract address
+            ping_frequency_days: Ping frequency in days (7=weekly, 1=daily, etc.)
         """
         try:
             self.config_manager = get_config_manager()
@@ -49,6 +52,7 @@ class ValsetUpdateMonitor:
             
             # store settings
             self.disable_discord = disable_discord
+            self.ping_frequency_days = ping_frequency_days
             
             # initialize Web3
             self.w3 = Web3(Web3.HTTPProvider(self.evm_rpc_url))
@@ -77,6 +81,13 @@ class ValsetUpdateMonitor:
             valset_dir.mkdir(parents=True, exist_ok=True)
             self.state_file = valset_dir / "last_valset_timestamp.json"
             self.last_validator_state = self._load_state()
+            
+            # initialize ping helper
+            self.ping_helper = PingHelper(
+                script_name="valset_update_monitor",
+                data_dir=data_dir,
+                discord_webhook_url=self.discord_webhook_url
+            )
             
             logger.info(f"Initialized ValsetUpdateMonitor for {self.layer_chain} → {self.evm_chain}")
             logger.info(f"Bridge contract: {self.bridge_contract_address}")
@@ -114,10 +125,11 @@ class ValsetUpdateMonitor:
         """Get Discord webhook URL for validator set update alerts"""
         try:
             # try to get from discord_webhooks configuration first
-            webhooks = self.config_manager.get_discord_webhooks()
-            if webhooks and 'valset_updates' in webhooks:
-                return webhooks['valset_updates']
+            webhook_url = self.config_manager.get_discord_webhook('valset_updates')
+            if webhook_url and webhook_url != "N/A":
+                return webhook_url
             
+            logger.warning("No valset_updates webhook found, using general webhook")
             # fallback to general discord webhook
             return self.config_manager.get_discord_webhook_url()
             
@@ -262,6 +274,31 @@ class ValsetUpdateMonitor:
             logger.error(f"Error checking for validator update: {e}")
             return None
     
+    def generate_ping_content(self) -> str:
+        """Generate ping content with current validator set information"""
+        try:
+            valset_info = self._get_current_validator_state()
+            if not valset_info:
+                return "**Status:** Unable to get validator set information"
+            
+            validator_timestamp = valset_info['validator_timestamp']
+            formatted_timestamp = self.ping_helper.format_timestamp_et(validator_timestamp)
+            
+            ping_content = (
+                f"**Current DataBridge Contract Validator Set:**\n"
+                f"**Bridge Contract:** `{self.bridge_contract_address}`\n"
+                f"**Validator Timestamp:** {validator_timestamp}\n"
+                f"**Human Readable:** {formatted_timestamp}\n"
+                f"**Checkpoint:** `{valset_info['validator_set_checkpoint']}`\n"
+                f"**Power Threshold:** {valset_info['power_threshold']}"
+            )
+            
+            return ping_content
+            
+        except Exception as e:
+            logger.error(f"Failed to generate ping content: {e}")
+            return f"**Status:** Error generating ping content: {e}"
+
     def send_discord_alert(self, update_info: Dict[str, Any]):
         """Send Discord alert for validator set update"""
         if self.disable_discord or not self.discord_webhook_url:
@@ -302,7 +339,7 @@ class ValsetUpdateMonitor:
         except Exception as e:
             logger.error(f"Failed to send Discord alert: {e}")
     
-    def run_once(self) -> Optional[Dict[str, Any]]:
+    def run_once(self, send_ping: bool = False) -> Optional[Dict[str, Any]]:
         """Run validator set check once and return results"""
         logger.info("Checking for validator set updates...")
         
@@ -314,18 +351,27 @@ class ValsetUpdateMonitor:
         else:
             logger.debug("No validator set updates detected")
         
+        # check for scheduled ping
+        if self.ping_helper.should_send_ping(self.ping_frequency_days) or send_ping:
+            ping_content = self.generate_ping_content()
+            self.ping_helper.send_ping(ping_content, self.ping_frequency_days, force=send_ping)
+        
         return update_info
     
-    def run_continuous(self, interval_minutes: int = 5):
+    def run_continuous(self, interval_minutes: int = 5, send_initial_ping: bool = False):
         """Run continuous monitoring with specified interval"""
         interval_seconds = interval_minutes * 60
         
         logger.info(f"Starting continuous validator set monitoring (interval: {interval_minutes}m)")
         
         try:
+            # First run - check if we should send initial ping
+            first_run = True
             while True:
                 try:
-                    self.run_once()
+                    send_ping_now = send_initial_ping and first_run
+                    self.run_once(send_ping=send_ping_now)
+                    first_run = False
                 except Exception as e:
                     logger.error(f"Error during monitoring cycle: {e}")
                 
@@ -345,6 +391,8 @@ def main():
     parser.add_argument('--no-discord', action='store_true', help='Disable Discord alerts')
     parser.add_argument('--bridge-address', type=str, help='Override TellorDataBridge contract address')
     parser.add_argument('--interval', type=int, default=5, help='Monitoring interval in minutes (default: 5)')
+    parser.add_argument('--ping-frequency', type=int, default=7, help='Ping frequency in days (default: 7)')
+    parser.add_argument('--ping-now', action='store_true', help='Send ping immediately')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose debug logging')
     
     args = parser.parse_args()
@@ -356,17 +404,18 @@ def main():
         # initialize monitor
         monitor = ValsetUpdateMonitor(
             disable_discord=args.no_discord,
-            bridge_contract_address=args.bridge_address
+            bridge_contract_address=args.bridge_address,
+            ping_frequency_days=args.ping_frequency
         )
         
         if args.once:
             # run once
-            update_info = monitor.run_once()
+            update_info = monitor.run_once(send_ping=args.ping_now)
             if update_info:
                 exit(0)  # successful detection
         else:
             # run continuously
-            monitor.run_continuous(interval_minutes=args.interval)
+            monitor.run_continuous(interval_minutes=args.interval, send_initial_ping=args.ping_now)
             
     except Exception as e:
         logger.error(f"Monitor failed: {e}")

@@ -26,16 +26,18 @@ import pytz
 from pathlib import Path
 from config_manager import get_config_manager
 from logger_utils import setup_logging
+from ping_helper import PingHelper
 
 # logging will be configured in main() based on --verbose flag
 logger = logging.getLogger(__name__)
 
 class AdaptorGuardianMonitor:
-    def __init__(self, disable_discord: bool = False):
+    def __init__(self, disable_discord: bool = False, ping_frequency_days: int = 7):
         """Initialize the adaptor guardian monitor
         
         Args:
             disable_discord: If True, skip sending Discord alerts
+            ping_frequency_days: Ping frequency in days (7=weekly, 1=daily, etc.)
         """
         try:
             self.config_manager = get_config_manager()
@@ -47,6 +49,7 @@ class AdaptorGuardianMonitor:
             
             # store settings
             self.disable_discord = disable_discord
+            self.ping_frequency_days = ping_frequency_days
             
             # initialize Web3
             self.w3 = Web3(Web3.HTTPProvider(self.evm_rpc_url))
@@ -78,6 +81,13 @@ class AdaptorGuardianMonitor:
             validation_dir.mkdir(parents=True, exist_ok=True)
             self.state_file = validation_dir / "adaptor_guardian_state.json"
             self.last_processed_block = self._load_state()
+            
+            # initialize ping helper
+            self.ping_helper = PingHelper(
+                script_name="adaptor_guardian_monitor",
+                data_dir=data_dir,
+                discord_webhook_url=self.discord_webhook_url
+            )
             
             logger.info(f"Initialized AdaptorGuardianMonitor for {self.layer_chain} → {self.evm_chain}")
             logger.info(f"Monitoring {len(self.adaptor_contracts)} adaptor contracts")
@@ -132,7 +142,7 @@ class AdaptorGuardianMonitor:
         """Get Discord webhook URL for guardian alerts"""
         try:
             # try to get specific guardian webhook first
-            webhook_url = self.config_manager.get_discord_webhook('malicious_activity')
+            webhook_url = self.config_manager.get_discord_webhook('adaptor_guardian')
             if webhook_url and webhook_url != "N/A":
                 return webhook_url
             
@@ -215,44 +225,66 @@ class AdaptorGuardianMonitor:
     def _get_events_for_contract(self, contract_address: str, from_block: int, to_block: int) -> List[Dict[str, Any]]:
         """Get all guardian/pause events for a specific contract in block range"""
         try:
-            contract = self.contract_instances[contract_address]
             events = []
             
-            # event names and their signatures
-            event_filters = [
-                ('GuardianAdded', contract.events.GuardianAdded),
-                ('GuardianRemoved', contract.events.GuardianRemoved),
-                ('AdminRemoved', contract.events.AdminRemoved),
-                ('Paused', contract.events.Paused),
-                ('Unpaused', contract.events.Unpaused)
-            ]
+            # calculate event topic signatures
+            guardian_added_topic = Web3.keccak(text="GuardianAdded(address)").hex()
+            guardian_removed_topic = Web3.keccak(text="GuardianRemoved(address)").hex()
+            admin_removed_topic = Web3.keccak(text="AdminRemoved()").hex()
+            paused_topic = Web3.keccak(text="Paused()").hex()
+            unpaused_topic = Web3.keccak(text="Unpaused()").hex()
             
-            for event_name, event_filter in event_filters:
-                try:
-                    logs = event_filter.getLogs(fromBlock=from_block, toBlock=to_block)
+            # event mappings
+            event_topics = {
+                guardian_added_topic: 'GuardianAdded',
+                guardian_removed_topic: 'GuardianRemoved',
+                admin_removed_topic: 'AdminRemoved',
+                paused_topic: 'Paused',
+                unpaused_topic: 'Unpaused'
+            }
+            
+            # get all logs for all event types at once
+            try:
+                logs = self.w3.eth.get_logs({
+                    "fromBlock": from_block,
+                    "toBlock": to_block,
+                    "address": contract_address,
+                    "topics": [list(event_topics.keys())]
+                })
+                
+                for log in logs:
+                    topic = log['topics'][0].hex()
+                    event_name = event_topics.get(topic, 'Unknown')
                     
-                    for log in logs:
-                        event_data = {
-                            'contract_address': contract_address,
-                            'event_name': event_name,
-                            'block_number': log['blockNumber'],
-                            'transaction_hash': log['transactionHash'].hex(),
-                            'args': dict(log['args']) if log['args'] else {}
-                        }
-                        
-                        # get block timestamp
-                        try:
-                            block = self.w3.eth.get_block(log['blockNumber'])
-                            event_data['timestamp'] = block['timestamp']
-                        except Exception as e:
-                            logger.warning(f"Failed to get block timestamp for block {log['blockNumber']}: {e}")
-                            event_data['timestamp'] = int(time.time())
-                        
-                        events.append(event_data)
-                        
-                except Exception as e:
-                    logger.warning(f"Failed to get {event_name} events for {contract_address}: {e}")
-                    continue
+                    # decode event args
+                    args = {}
+                    if event_name in ['GuardianAdded', 'GuardianRemoved'] and len(log['topics']) > 1:
+                        # guardian address is the second topic (indexed parameter)
+                        guardian_hex = log['topics'][1].hex()
+                        # convert to address format (remove leading zeros and add 0x)
+                        args['guardian'] = '0x' + guardian_hex[-40:]
+                    
+                    event_data = {
+                        'contract_address': contract_address,
+                        'event_name': event_name,
+                        'block_number': log['blockNumber'],
+                        'transaction_hash': log['transactionHash'].hex(),
+                        'args': args
+                    }
+                    
+                    # get block timestamp
+                    try:
+                        block = self.w3.eth.get_block(log['blockNumber'])
+                        event_data['timestamp'] = block['timestamp']
+                    except Exception as e:
+                        logger.warning(f"Failed to get block timestamp for block {log['blockNumber']}: {e}")
+                        event_data['timestamp'] = int(time.time())
+                    
+                    events.append(event_data)
+                    
+            except Exception as e:
+                logger.warning(f"Failed to get events for {contract_address}: {e}")
+                return []
             
             # sort events by block number and transaction index
             events.sort(key=lambda x: (x['block_number'], x['transaction_hash']))
@@ -297,6 +329,72 @@ class AdaptorGuardianMonitor:
             logger.error(f"Failed to check guardian events: {e}")
             return []
     
+    def generate_ping_content(self) -> str:
+        """Generate ping content with current admin and guardian information"""
+        try:
+            ping_content = (
+                f"**Monitoring Guardian Events:**\n"
+                f"**Adaptors Monitored:** {len(self.adaptor_contracts)}\n\n"
+            )
+            
+            # collect admin and guardian information from all contracts
+            admin_contracts = {}  # admin_address -> {project -> [descriptions]}
+            guardian_contracts = {}  # guardian_address -> {project -> [descriptions]}
+            
+            for adaptor_config in self.adaptor_contracts:
+                contract_address = adaptor_config['address']
+                description = adaptor_config['description']
+                
+                try:
+                    contract = self.contract_instances[contract_address]
+                    
+                    # get contract info
+                    contract_info = self._get_contract_info(contract)
+                    project = contract_info.get('project', 'Unknown Project')
+                    
+                    # get admin
+                    try:
+                        admin_address = contract.functions.admin().call()
+                        if admin_address and admin_address != "0x0000000000000000000000000000000000000000":
+                            if admin_address not in admin_contracts:
+                                admin_contracts[admin_address] = {}
+                            if project not in admin_contracts[admin_address]:
+                                admin_contracts[admin_address][project] = []
+                            admin_contracts[admin_address][project].append(description)
+                    except Exception as e:
+                        logger.debug(f"Could not get admin for {contract_address}: {e}")
+                    
+                    # get guardians
+                    try:
+                        guardian_count = contract.functions.guardianCount().call()
+                        for i in range(guardian_count):
+                            # unfortunately, we can't easily iterate guardians without knowing addresses
+                            # we'll need to check known admin addresses as they're often guardians too
+                            pass
+                    except Exception as e:
+                        logger.debug(f"Could not get guardians for {contract_address}: {e}")
+                        
+                except Exception as e:
+                    logger.debug(f"Error processing contract {contract_address}: {e}")
+            
+            # add admin information
+            if admin_contracts:
+                ping_content += "**Admin(s):**\n"
+                for admin_address, projects in admin_contracts.items():
+                    ping_content += f"{admin_address}...\n"
+                    for project, descriptions in projects.items():
+                        descriptions_str = ", ".join(descriptions)
+                        ping_content += f"{project}: {descriptions_str}\n"
+                    ping_content += "\n"
+            else:
+                ping_content += "**Admin(s):** None found\n\n"
+            
+            return ping_content
+            
+        except Exception as e:
+            logger.error(f"Failed to generate ping content: {e}")
+            return f"**Status:** Error generating ping content: {e}"
+
     def send_discord_alert(self, event: Dict[str, Any]):
         """Send Discord alert for guardian/pause event"""
         if self.disable_discord or not self.discord_webhook_url:
@@ -364,7 +462,7 @@ class AdaptorGuardianMonitor:
         except Exception as e:
             logger.error(f"Failed to send Discord alert: {e}")
     
-    def run_once(self) -> List[Dict[str, Any]]:
+    def run_once(self, send_ping: bool = False) -> List[Dict[str, Any]]:
         """Run guardian monitoring once and return detected events"""
         logger.info("Checking for guardian and pause events...")
         
@@ -377,6 +475,11 @@ class AdaptorGuardianMonitor:
                 self.send_discord_alert(event)
         else:
             logger.debug("No guardian/pause events detected")
+        
+        # check for scheduled ping
+        if self.ping_helper.should_send_ping(self.ping_frequency_days) or send_ping:
+            ping_content = self.generate_ping_content()
+            self.ping_helper.send_ping(ping_content, self.ping_frequency_days, force=send_ping)
         
         return events
     
@@ -408,6 +511,8 @@ def main():
     parser.add_argument('--once', action='store_true', help='Run once instead of continuously')
     parser.add_argument('--no-discord', action='store_true', help='Disable Discord alerts')
     parser.add_argument('--interval', type=int, default=5, help='Monitoring interval in minutes (default: 5)')
+    parser.add_argument('--ping-frequency', type=int, default=7, help='Ping frequency in days (default: 7)')
+    parser.add_argument('--ping-now', action='store_true', help='Send ping immediately')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose debug logging')
     
     args = parser.parse_args()
@@ -418,12 +523,13 @@ def main():
     try:
         # initialize monitor
         monitor = AdaptorGuardianMonitor(
-            disable_discord=args.no_discord
+            disable_discord=args.no_discord,
+            ping_frequency_days=args.ping_frequency
         )
         
         if args.once:
             # run once
-            events = monitor.run_once()
+            events = monitor.run_once(send_ping=args.ping_now)
             if events:
                 print(f"\nDetected Events:")
                 for event in events:
