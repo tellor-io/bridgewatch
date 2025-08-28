@@ -66,6 +66,18 @@ python src/valset_integrity_monitor.py [--once] [--verbose]
 ```
 Verifies validator set integrity between TellorDataBridge contracts and Tellor Layer.
 
+### Frequency Monitor
+```bash
+python src/frequency_monitor.py [--report-now] [--days N] [--verbose]
+```
+Generates periodic reports on data feed activity. Runs weekly reports on Tuesdays at 9am ET by default.
+
+### Adaptor Guardian Monitor
+```bash
+python src/adaptor_guardian_monitor.py [--once] [--verbose]
+```
+Monitors GuardedLiquityV2OracleAdaptor contracts for guardian management and pause/unpause events.
+
 ### Common Options
 - `--once` - Run once instead of continuously
 - `--verbose` - Enable verbose debug logging
@@ -75,4 +87,3 @@ Verifies validator set integrity between TellorDataBridge contracts and Tellor L
 ## Configuration
 
 The system uses `config.json` for multi-bridge configurations. Each configuration has its own data directory and settings. Environment variables can be referenced using `${VAR_NAME}` syntax.
-

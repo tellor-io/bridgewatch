@@ -84,7 +84,8 @@
           "malicious_activity": "${DISCORD_WEBHOOK_URL_SAGA}",
           "valset_updates": "${DISCORD_VALSET_ALERTS_SAGA}",
           "valset_stale": "${DISCORD_VALSET_STALE_ALERTS_SAGA}",
-          "feed_stale": "${DISCORD_FEED_STALE_SAGA}"
+          "feed_stale": "${DISCORD_FEED_STALE_SAGA}",
+          "data_frequency": "${DISCORD_DATA_FREQUENCY_SAGA}"
       },
       "data_dir": "data/tellor-1_saga_bridge",
       "database_path": "databases/tellor-1_saga_bridge.duckdb"

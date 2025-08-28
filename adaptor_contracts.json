@@ -1,0 +1,61 @@
+{
+  "contracts": [
+    {
+      "address": "0x0cD65ca12F6c9b10254FABC0CC62d273ABbb3d84",
+      "description": "eth/usd"
+    },
+    {
+      "address": "0x4a397383fE5FbE9AB33879869153fF40ea68815F",
+      "description": "btc/usd"
+    },
+    {
+      "address": "0xaA43df021149C34ca3654F387C9aeB9AcABa012a",
+      "description": "saga/usd"
+    },
+    {
+      "address": "0x6c85266a8D3Ce564058667dc5c7E9d58da454ecc",
+      "description": "usdc/usd"
+    },
+    {
+      "address": "0x62E537964E2452aD6F08976dA251C4B33c04B96C",
+      "description": "usdt/usd"
+    },
+    {
+      "address": "0x9fe237b245466A5f088AfE808b27c1305E3027BC",
+      "description": "fbtc/usd"
+    },
+    {
+      "address": "0x8f5bb98bdcC11B663c40e8299507b660D59831a8",
+      "description": "USDN/USD"
+    },
+    {
+      "address": "0xD9f9d0B4ed529B975265546b83d6B40FD171de42",
+      "description": "SUSDS/USD"
+    },
+    {
+      "address": "0x21dAe0785f3d94Bf20BeFBB9362f528DAEAe75cE",
+      "description": "yUSD/USD"
+    },
+    {
+      "address": "0x9494Ed94280E9A8c5b52B1cDa9Ac9D21f6307135",
+      "description": "tBTC/USD"
+    },
+    {
+      "address": "0x7B1be2C7B390A1FA29e07504f2a46A8Dc07eD9F4",
+      "description": "rETH/USD"
+    },
+    {
+      "address": "0xAD4Ed25C667e6FecEB0fee67E2c52eb5481B9322",
+      "description": "wstETH/USD"
+    },
+    {
+      "address": "0x0Efc8e534F3f4e73cbDB8623cb23e76d955e2130",
+      "description": "KING/USD"
+    },
+    {
+      "address": "0x7B5B292EB1d80164D693733f365fe0a588991eFE",
+      "description": "sUSDe/usd"
+    }
+  ],
+  "monitoring_interval_minutes": 5
+} 
