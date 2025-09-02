@@ -112,6 +112,9 @@ class PingHelper:
     def should_send_ping(self, frequency_days: int = 7) -> bool:
         """Check if it's time to send a ping based on frequency
         
+        Uses a basis-based scheduling system to prevent time drift.
+        Default basis: Tuesday Aug 5, 2025 9:00 AM ET (timestamp 1754398800)
+        
         Args:
             frequency_days: Ping frequency in days (7=weekly, 1=daily, etc.)
         """
@@ -121,28 +124,34 @@ class PingHelper:
         state = self._load_ping_state()
         last_ping_timestamp = state.get('last_ping_timestamp', 0)
         
-        # convert to ET timezone for comparison
-        now_et = datetime.now(self.eastern_tz)
+        # basis timestamp: Tuesday Aug 5, 2025 9:00 AM ET
+        basis_timestamp = 1754398800
+        interval_seconds = frequency_days * 24 * 3600
+        now_timestamp = time.time()
         
         if last_ping_timestamp == 0:
-            # first time - check if it's past 9am ET today
-            if now_et.hour >= 9:
+            # first time - send ping now if we've passed the first interval after basis
+            if now_timestamp >= basis_timestamp:
                 logger.debug(f"First ping for {self.script_name} - sending now")
                 return True
             else:
-                logger.debug(f"First ping for {self.script_name} - waiting for 9am ET")
+                basis_dt = datetime.fromtimestamp(basis_timestamp, tz=self.eastern_tz)
+                logger.debug(f"First ping for {self.script_name} - waiting for {basis_dt}")
                 return False
         
-        # calculate next expected ping time
-        last_ping_dt = datetime.fromtimestamp(last_ping_timestamp, tz=self.eastern_tz)
-        next_ping_time = self._get_next_ping_time(frequency_days)
+        # find the next interval timestamp after the last ping
+        intervals_since_basis = int((last_ping_timestamp - basis_timestamp) / interval_seconds)
+        next_interval_timestamp = basis_timestamp + (interval_seconds * (intervals_since_basis + 1))
         
-        # check if we've passed the next ping time
-        if now_et >= next_ping_time:
-            logger.debug(f"Time for scheduled ping: {next_ping_time} (now: {now_et})")
+        if now_timestamp >= next_interval_timestamp:
+            next_interval_dt = datetime.fromtimestamp(next_interval_timestamp, tz=self.eastern_tz)
+            now_dt = datetime.fromtimestamp(now_timestamp, tz=self.eastern_tz)
+            logger.debug(f"Time for scheduled ping: {next_interval_dt} (now: {now_dt})")
             return True
         
-        logger.debug(f"Next ping scheduled for: {next_ping_time} (now: {now_et})")
+        next_interval_dt = datetime.fromtimestamp(next_interval_timestamp, tz=self.eastern_tz)
+        now_dt = datetime.fromtimestamp(now_timestamp, tz=self.eastern_tz)
+        logger.debug(f"Next ping scheduled for: {next_interval_dt} (now: {now_dt})")
         return False
     
     def send_ping(self, ping_content: str, frequency_days: int = 7, force: bool = False):

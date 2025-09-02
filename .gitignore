@@ -6,3 +6,4 @@ docs/
 data_backup/
 .DS_Store
 databases/
+config.json

@@ -394,11 +394,21 @@ def main():
     parser.add_argument('--days', type=int, default=7, help='Report period in days (default: 7)')
     parser.add_argument('--report-now', action='store_true', help='Generate and send report immediately')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose debug logging')
+    parser.add_argument('--config', type=str, help='Specify which configuration profile to use (overrides ACTIVE_CONFIG)')
     
     args = parser.parse_args()
     
+    # set config override if --config flag was provided
+    if args.config:
+        from config import set_global_config_override
+        set_global_config_override(args.config)
+    
     # setup logging based on verbose flag
     setup_logging(verbose=args.verbose)
+    
+    # log which config we're using if override was provided
+    if args.config:
+        logger.info(f"🔧 Using configuration: {args.config}")
     
     try:
         # initialize monitor
