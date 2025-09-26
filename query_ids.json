@@ -41,14 +41,14 @@
       "description": "sUSDe to USD spot price"
     },
     {
-      "queryId": "0xa396062006158d539a9b57c2049a936ba947bbdeecc1058235c45b21d23ecc57",
-      "name": "SpotPrice(susdn,usd)",
-      "description": "sUSDN to USD spot price"
-    },
-    {
       "queryId": "0x59ae85cec665c779f18255dd4f3d97821e6a122691ee070b9a26888bc2a0e45a",
       "name": "SpotPrice(susds,usd)",
       "description": "sUSDS to USD spot price"
+    },
+    {
+      "queryId": "0x187f74d310dc494e6efd928107713d4229cd319c2cf300224de02776090809f1",
+      "name": "SpotPrice(susn,usd)",
+      "description": "sUSN to USD spot price"
     },
     {
       "queryId": "0x76b504e33305a63a3b80686c0b7bb99e7697466927ba78e224728e80bfaaa0be",

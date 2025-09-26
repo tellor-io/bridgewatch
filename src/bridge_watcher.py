@@ -42,10 +42,11 @@ from database_cli import DATABASE_COMMANDS
 from database_manager import DatabaseLockError
 
 class BridgeWatcher:
-    def __init__(self, min_height: Optional[int] = None, disable_discord: bool = False):
+    def __init__(self, min_height: Optional[int] = None, disable_discord: bool = False, send_initial_ping: bool = False):
         self.running = False
         self.min_height = min_height
         self.disable_discord = disable_discord
+        self.send_initial_ping = send_initial_ping
         
         # get config manager for directory paths
         try:
@@ -285,6 +286,19 @@ class BridgeWatcher:
         self.running = True
         state = self.load_watcher_state()
         
+        # initial pings if requested or first-time schedule
+        try:
+            if hasattr(self.valset_verifier, 'ping_helper'):
+                if self.send_initial_ping or self.valset_verifier.ping_helper.should_send_ping(self.valset_verifier.ping_frequency_days):
+                    content = self.valset_verifier.generate_ping_content()
+                    self.valset_verifier.ping_helper.send_ping(content, self.valset_verifier.ping_frequency_days, force=self.send_initial_ping)
+            if hasattr(self.attest_verifier, 'ping_helper'):
+                if self.send_initial_ping or self.attest_verifier.ping_helper.should_send_ping(self.attest_verifier.ping_frequency_days):
+                    content = self.attest_verifier.generate_ping_content()
+                    self.attest_verifier.ping_helper.send_ping(content, self.attest_verifier.ping_frequency_days, force=self.send_initial_ping)
+        except Exception as e:
+            logger.warning(f"Initial ping failed: {e}")
+
         while self.running:
             try:
                 cycle_success = self.run_single_cycle()
@@ -321,6 +335,19 @@ class BridgeWatcher:
         """Run monitoring once and exit"""
         logger.info("🎯 Running bridge monitoring once")
         
+        # send initial ping if requested and supported
+        try:
+            if hasattr(self.valset_verifier, 'ping_helper'):
+                if self.send_initial_ping or self.valset_verifier.ping_helper.should_send_ping(self.valset_verifier.ping_frequency_days):
+                    content = self.valset_verifier.generate_ping_content()
+                    self.valset_verifier.ping_helper.send_ping(content, self.valset_verifier.ping_frequency_days, force=self.send_initial_ping)
+            if hasattr(self.attest_verifier, 'ping_helper'):
+                if self.send_initial_ping or self.attest_verifier.ping_helper.should_send_ping(self.attest_verifier.ping_frequency_days):
+                    content = self.attest_verifier.generate_ping_content()
+                    self.attest_verifier.ping_helper.send_ping(content, self.attest_verifier.ping_frequency_days, force=self.send_initial_ping)
+        except Exception as e:
+            logger.warning(f"Initial ping failed: {e}")
+
         success = self.run_single_cycle()
         
         if success:
@@ -383,7 +410,7 @@ class BridgeWatcher:
             print()
             print("📁 Data Files:")
             
-            chain_id = config.get_chain_id()
+            chain_id = config_module.config.get_chain_id()
             data_files = [
                 f"{checkpoint_dir}/{chain_id}_checkpoints.csv",
                 f"{valset_dir}/valset_updates.csv", 
@@ -496,6 +523,7 @@ Examples:
     start_parser.add_argument('--no-color', action='store_true', help='Disable colored output')
     start_parser.add_argument('--no-discord', action='store_true', help='Disable Discord alerts')
     start_parser.add_argument('--config', type=str, help='Specify which configuration profile to use (overrides ACTIVE_CONFIG)')
+    start_parser.add_argument('--ping-now', action='store_true', help='Send immediate pings for verifiers on start')
     
     # status command
     status_parser = subparsers.add_parser('status', help='Show current status')
@@ -560,6 +588,8 @@ Examples:
     valset_alerts_parser.add_argument('--no-color', action='store_true', help='Disable colored output')
     valset_alerts_parser.add_argument('--no-discord', action='store_true', help='Disable Discord alerts')
     valset_alerts_parser.add_argument('--config', type=str, help='Specify which configuration profile to use (overrides ACTIVE_CONFIG)')
+    valset_alerts_parser.add_argument('--ping-frequency', type=int, default=7, help='Ping frequency in days (default: 7)')
+    valset_alerts_parser.add_argument('--ping-now', action='store_true', help='Send an immediate ping on start')
     
     # valset-stale-alerts command
     valset_stale_alerts_parser = subparsers.add_parser('valset-stale-alerts', help='Monitor and alert when validator set becomes stale')
@@ -602,7 +632,7 @@ Examples:
             if getattr(args, 'no_discord', False):
                 logger.warning("⚠️  Discord alerts are DISABLED via --no-discord flag")
             
-            watcher = BridgeWatcher(min_height=args.min_height, disable_discord=getattr(args, 'no_discord', False))
+            watcher = BridgeWatcher(min_height=args.min_height, disable_discord=getattr(args, 'no_discord', False), send_initial_ping=getattr(args, 'ping_now', False))
             if args.once:
                 watcher.run_once()
             else:
@@ -764,13 +794,13 @@ Examples:
             logger.info("🔔 Starting Valset Alerter...")
             
             try:
-                alerter = ValsetAlerter(disable_discord=getattr(args, 'no_discord', False))
+                alerter = ValsetAlerter(disable_discord=getattr(args, 'no_discord', False), ping_frequency_days=getattr(args, 'ping_frequency', 7))
                 
                 if args.once:
-                    alerts_sent = alerter.run_once()
+                    alerts_sent = alerter.run_once(send_ping=getattr(args, 'ping_now', False))
                     logger.info(f"✅ Sent {alerts_sent} valset update alerts")
                 else:
-                    alerter.run_continuous(args.interval)
+                    alerter.run_continuous(args.interval, send_initial_ping=getattr(args, 'ping_now', False))
                     
             except Exception as e:
                 logger.error(f"❌ Valset alerter failed: {e}")

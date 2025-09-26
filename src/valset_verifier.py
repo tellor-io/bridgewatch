@@ -26,7 +26,9 @@ import os
 import hashlib
 from eth_utils import decode_hex
 from eth_keys import keys
+import pytz
 from config import config, get_config_manager
+from ping_helper import PingHelper
 from ping_helper import PingHelper
 
 # configure logging
@@ -94,6 +96,24 @@ class ValsetVerifier:
         self.validation_csv_file = f"{self.data_dir}/{chain_id}_valset_validation_results.csv"
         self.evidence_file = f"{self.data_dir}/{chain_id}_valset_evidence_commands.txt"
         self.failure_log_file = f"{self.data_dir}/{chain_id}_valset_validation_failures.log"
+        
+        # ping configuration
+        try:
+            # prefer top-level data dir for ping state, fallback to validation dir
+            try:
+                cm = get_config_manager()
+                data_dir_for_ping = cm.get_data_dir()
+            except Exception:
+                data_dir_for_ping = self.data_dir
+            
+            self.ping_frequency_days = 7
+            self.ping_helper = PingHelper(
+                script_name="valset_verifier",
+                data_dir=data_dir_for_ping,
+                discord_webhook_url=self.discord_webhook_url
+            )
+        except Exception as e:
+            logger.warning(f"Failed to initialize PingHelper: {e}")
         
         # ping configuration
         try:
@@ -694,6 +714,13 @@ class ValsetVerifier:
         checkpoints = self.load_checkpoint_data()
         all_valset_updates = self.load_valset_data()
         
+        # scheduled weekly ping before early return paths
+        try:
+            if getattr(self, 'ping_helper', None) and self.ping_helper.should_send_ping(self.ping_frequency_days):
+                self.ping_helper.send_ping(self.generate_ping_content(), self.ping_frequency_days)
+        except Exception as e:
+            logger.warning(f"Ping check/send failed: {e}")
+        
         if not checkpoints:
             logger.error("No checkpoint data available")
             return
@@ -986,7 +1013,19 @@ class ValsetVerifier:
             total = state.get('total_validations', 0)
             last_tx = state.get('last_tx_hash', 'none')
             last_block = state.get('last_block_number', 0)
-            last_time = state.get('last_validation_timestamp', 'Never')
+            last_time_raw = state.get('last_validation_timestamp', 'Never')
+            # Convert last validation time to US Eastern timezone for display
+            last_time = "Never"
+            if isinstance(last_time_raw, str) and last_time_raw != "Never":
+                try:
+                    iso_string = last_time_raw.replace('Z', '+00:00')
+                    parsed_dt = datetime.fromisoformat(iso_string)
+                    if parsed_dt.tzinfo is None:
+                        parsed_dt = pytz.UTC.localize(parsed_dt)
+                    eastern_tz = pytz.timezone('US/Eastern')
+                    last_time = parsed_dt.astimezone(eastern_tz).strftime('%Y-%m-%d %H:%M:%S %Z')
+                except Exception:
+                    last_time = last_time_raw
             return (
                 f"**Valset Verifier**\n"
                 f"**Total Validations:** {total}\n"

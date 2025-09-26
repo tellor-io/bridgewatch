@@ -34,7 +34,7 @@ class DatabaseLockError(Exception):
     pass
 
 class ValsetAlerter:
-    def __init__(self, disable_discord: bool = False):
+    def __init__(self, disable_discord: bool = False, ping_frequency_days: int = 7):
         """Initialize the valset alerter"""
         try:
             self.config_manager = get_config_manager()
@@ -61,7 +61,7 @@ class ValsetAlerter:
             self.eastern_tz = pytz.timezone('US/Eastern')
             
             # ping configuration
-            self.ping_frequency_days = 7
+            self.ping_frequency_days = ping_frequency_days
             self.ping_helper = PingHelper(
                 script_name="valset_alerter",
                 data_dir=self.config_manager.get_data_dir(),
@@ -297,7 +297,20 @@ class ValsetAlerter:
             last_tx = state.get('last_tx_hash', 'none')
             last_block = state.get('last_block_number', 0)
             total_alerts = state.get('total_alerts_sent', 0)
-            last_alert_ts = state.get('last_alert_timestamp', 'Never')
+            last_alert_raw = state.get('last_alert_timestamp', 'Never')
+            # Convert last alert time to US Eastern timezone for display
+            last_alert_ts = "Never"
+            if isinstance(last_alert_raw, str) and last_alert_raw != "Never":
+                try:
+                    iso_string = last_alert_raw.replace('Z', '+00:00')
+                    parsed_dt = datetime.fromisoformat(iso_string)
+                    if parsed_dt.tzinfo is None:
+                        import pytz
+                        parsed_dt = pytz.UTC.localize(parsed_dt)
+                    eastern_tz = self.eastern_tz if hasattr(self, 'eastern_tz') else __import__('pytz').timezone('US/Eastern')
+                    last_alert_ts = parsed_dt.astimezone(eastern_tz).strftime('%Y-%m-%d %H:%M:%S %Z')
+                except Exception:
+                    last_alert_ts = last_alert_raw
             return (
                 f"**Bridge:** {self.layer_chain} → {self.evm_chain}\n"
                 f"**Total Alerts Sent:** {total_alerts}\n"
@@ -309,7 +322,7 @@ class ValsetAlerter:
             logger.error(f"Failed to generate ping content: {e}")
             return f"**Status:** Error generating ping content: {e}"
     
-    def run_once(self) -> int:
+    def run_once(self, send_ping: bool = False) -> int:
         """Run once and process all new valset updates"""
         logger.info("Starting valset alerter (run once)")
         
@@ -324,6 +337,14 @@ class ValsetAlerter:
             logger.warning(f"Skipping cycle due to database lock: {e}")
             return -1  # special return code indicating database lock
         
+        # scheduled ping before early return path
+        try:
+            if self.ping_helper.should_send_ping(self.ping_frequency_days) or send_ping:
+                ping_content = self.generate_ping_content(state)
+                self.ping_helper.send_ping(ping_content, self.ping_frequency_days, force=send_ping)
+        except Exception as e:
+            logger.warning(f"Ping check/send failed: {e}")
+
         if not new_updates:
             logger.info("No new valset updates to alert on")
             return 0
@@ -356,15 +377,55 @@ class ValsetAlerter:
         logger.info(f"✅ Sent {alerts_sent} valset update alerts")
         logger.info(f"📊 Total alerts sent: {state['total_alerts_sent']}")
         
-        # scheduled weekly ping
+        # scheduled weekly ping (post-processing)
         try:
-            if self.ping_helper.should_send_ping(self.ping_frequency_days):
+            if self.ping_helper.should_send_ping(self.ping_frequency_days) or send_ping:
                 ping_content = self.generate_ping_content(state)
-                self.ping_helper.send_ping(ping_content, self.ping_frequency_days)
+                self.ping_helper.send_ping(ping_content, self.ping_frequency_days, force=send_ping)
         except Exception as e:
             logger.warning(f"Ping check/send failed: {e}")
         
         return alerts_sent
+
+    def run_continuous(self, interval_seconds: int = 60, send_initial_ping: bool = False):
+        """Run continuously, checking for new updates every interval"""
+        logger.info(f"Starting valset alerter (continuous mode, interval: {interval_seconds}s)")
+        
+        consecutive_lock_errors = 0
+        base_backoff_sleep = 5
+        first_run = True
+        
+        while True:
+            try:
+                send_now = send_initial_ping and first_run
+                alerts_sent = self.run_once(send_ping=send_now)
+                first_run = False
+                
+                if alerts_sent == -1:  # database lock error
+                    consecutive_lock_errors += 1
+                    sleep_time = min(base_backoff_sleep * (2 ** (consecutive_lock_errors - 1)), 300)
+                    sleep_time = sleep_time * (1 + random.uniform(-0.1, 0.1))
+                    logger.info(f"Database locked ({consecutive_lock_errors} consecutive), retrying in {sleep_time}s...")
+                    time.sleep(sleep_time)
+                    continue
+                else:
+                    consecutive_lock_errors = 0
+                    if alerts_sent > 0:
+                        logger.info(f"Cycle complete: sent {alerts_sent} alerts")
+                    else:
+                        logger.debug("Cycle complete: no new updates")
+            
+                logger.info(f"Sleeping for {interval_seconds} seconds...")
+                time.sleep(interval_seconds)
+                
+            except KeyboardInterrupt:
+                logger.info("Received interrupt signal, shutting down...")
+                break
+            except Exception as e:
+                logger.error(f"Error in continuous loop: {e}")
+                consecutive_lock_errors = 0
+                logger.info(f"Retrying in {interval_seconds} seconds...")
+                time.sleep(interval_seconds)
     
     def run_continuous(self, interval_seconds: int = 60):
         """Run continuously, checking for new updates every interval"""
@@ -422,6 +483,8 @@ def main():
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     parser.add_argument('--no-discord', action='store_true', help='Disable Discord alerts')
     parser.add_argument('--config', type=str, help='Specify which configuration profile to use (overrides ACTIVE_CONFIG)')
+    parser.add_argument('--ping-frequency', type=int, default=7, help='Ping frequency in days (default: 7)')
+    parser.add_argument('--ping-now', action='store_true', help='Send an immediate ping on start')
     
     args = parser.parse_args()
     
@@ -439,17 +502,17 @@ def main():
         logger.warning("⚠️  Discord alerts are DISABLED via --no-discord flag")
     
     try:
-        alerter = ValsetAlerter(disable_discord=args.no_discord)
+        alerter = ValsetAlerter(disable_discord=args.no_discord, ping_frequency_days=args.ping_frequency)
         
         if args.once:
-            alerts_sent = alerter.run_once()
+            alerts_sent = alerter.run_once(send_ping=args.ping_now)
             if alerts_sent == -1:
                 print("Skipped due to database lock")
                 exit(2)
             else:
                 print(f"Sent {alerts_sent} alerts")
         else:
-            alerter.run_continuous(args.interval)
+            alerter.run_continuous(args.interval, send_initial_ping=args.ping_now)
             
     except Exception as e:
         logger.error(f"Valset alerter failed: {e}")
