@@ -426,48 +426,6 @@ class ValsetAlerter:
                 consecutive_lock_errors = 0
                 logger.info(f"Retrying in {interval_seconds} seconds...")
                 time.sleep(interval_seconds)
-    
-    def run_continuous(self, interval_seconds: int = 60):
-        """Run continuously, checking for new updates every interval"""
-        logger.info(f"Starting valset alerter (continuous mode, interval: {interval_seconds}s)")
-        
-        consecutive_lock_errors = 0
-        base_backoff_sleep = 5
-        
-        while True:
-            try:
-                alerts_sent = self.run_once()
-                
-                if alerts_sent == -1:  # database lock error
-                    consecutive_lock_errors += 1
-                    # exponential backoff for lock errors, but cap at 5 minutes
-                    sleep_time = min(base_backoff_sleep * (2 ** (consecutive_lock_errors - 1)), 300)
-                    # add a random jitter to the sleep time so we don't all retry at the same time
-                    sleep_time = sleep_time * (1 + random.uniform(-0.1, 0.1))
-                    logger.info(f"Database locked ({consecutive_lock_errors} consecutive), retrying in {sleep_time}s...")
-                    time.sleep(sleep_time)
-                    continue
-                else:
-                    # reset lock error counter on successful run
-                    consecutive_lock_errors = 0
-                    
-                    if alerts_sent > 0:
-                        logger.info(f"Cycle complete: sent {alerts_sent} alerts")
-                    else:
-                        logger.debug("Cycle complete: no new updates")
-                
-                logger.info(f"Sleeping for {interval_seconds} seconds...")
-                time.sleep(interval_seconds)
-                
-            except KeyboardInterrupt:
-                logger.info("Received interrupt signal, shutting down...")
-                break
-            except Exception as e:
-                logger.error(f"Error in continuous loop: {e}")
-                consecutive_lock_errors = 0  # reset since this isn't a lock error
-                logger.info(f"Retrying in {interval_seconds} seconds...")
-                time.sleep(interval_seconds)
-
 
 def main():
     """Main entry point for valset alerter"""
