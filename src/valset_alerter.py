@@ -23,6 +23,7 @@ from web3 import Web3
 import pytz
 from config_manager import get_config_manager
 import random
+from ping_helper import PingHelper
 
 # configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -58,6 +59,14 @@ class ValsetAlerter:
             
             # set up timezone converter
             self.eastern_tz = pytz.timezone('US/Eastern')
+            
+            # ping configuration
+            self.ping_frequency_days = 7
+            self.ping_helper = PingHelper(
+                script_name="valset_alerter",
+                data_dir=self.config_manager.get_data_dir(),
+                discord_webhook_url=self.discord_webhook_url
+            )
             
             logger.info(f"Initialized ValsetAlerter for {self.layer_chain} → {self.evm_chain}")
             logger.info(f"Bridge contract: {self.bridge_contract}")
@@ -279,6 +288,26 @@ class ValsetAlerter:
         except Exception as e:
             logger.error(f"Failed to send Discord alert for {update['tx_hash']}: {e}")
             return False
+
+    def generate_ping_content(self, state: Optional[Dict[str, Any]] = None) -> str:
+        """Generate ping content summarizing current valset alerting status"""
+        try:
+            if state is None:
+                state = self.load_alerter_state()
+            last_tx = state.get('last_tx_hash', 'none')
+            last_block = state.get('last_block_number', 0)
+            total_alerts = state.get('total_alerts_sent', 0)
+            last_alert_ts = state.get('last_alert_timestamp', 'Never')
+            return (
+                f"**Bridge:** {self.layer_chain} → {self.evm_chain}\n"
+                f"**Total Alerts Sent:** {total_alerts}\n"
+                f"**Last Alert Tx:** `{last_tx}`\n"
+                f"**Last Block:** `{last_block}`\n"
+                f"**Last Alert Time:** {last_alert_ts}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to generate ping content: {e}")
+            return f"**Status:** Error generating ping content: {e}"
     
     def run_once(self) -> int:
         """Run once and process all new valset updates"""
@@ -326,6 +355,14 @@ class ValsetAlerter:
         
         logger.info(f"✅ Sent {alerts_sent} valset update alerts")
         logger.info(f"📊 Total alerts sent: {state['total_alerts_sent']}")
+        
+        # scheduled weekly ping
+        try:
+            if self.ping_helper.should_send_ping(self.ping_frequency_days):
+                ping_content = self.generate_ping_content(state)
+                self.ping_helper.send_ping(ping_content, self.ping_frequency_days)
+        except Exception as e:
+            logger.warning(f"Ping check/send failed: {e}")
         
         return alerts_sent
     

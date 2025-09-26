@@ -26,13 +26,15 @@ import os
 import hashlib
 from eth_utils import decode_hex
 from eth_keys import keys
+from config import config, get_config_manager
+from ping_helper import PingHelper
 
 # configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # import config
-from config import config, get_config_manager
+# from config import config, get_config_manager
 
 # configuration from config module
 DEFAULT_LAYER_RPC_URL = config.get_layer_rpc_url()
@@ -92,6 +94,24 @@ class ValsetVerifier:
         self.validation_csv_file = f"{self.data_dir}/{chain_id}_valset_validation_results.csv"
         self.evidence_file = f"{self.data_dir}/{chain_id}_valset_evidence_commands.txt"
         self.failure_log_file = f"{self.data_dir}/{chain_id}_valset_validation_failures.log"
+        
+        # ping configuration
+        try:
+            # prefer top-level data dir for ping state, fallback to validation dir
+            try:
+                cm = get_config_manager()
+                data_dir_for_ping = cm.get_data_dir()
+            except Exception:
+                data_dir_for_ping = self.data_dir
+            
+            self.ping_frequency_days = 7
+            self.ping_helper = PingHelper(
+                script_name="valset_verifier",
+                data_dir=data_dir_for_ping,
+                discord_webhook_url=self.discord_webhook_url
+            )
+        except Exception as e:
+            logger.warning(f"Failed to initialize PingHelper: {e}")
         
         # initialize CSV file
         self.init_results_csv()
@@ -764,6 +784,14 @@ class ValsetVerifier:
         logger.info(f"Results saved to: {self.validation_csv_file}")
         logger.info(f"State saved to: {self.state_file}")
 
+        # scheduled weekly ping
+        try:
+            if getattr(self, 'ping_helper', None) and self.ping_helper.should_send_ping(self.ping_frequency_days):
+                ping_content = self.generate_ping_content()
+                self.ping_helper.send_ping(ping_content, self.ping_frequency_days)
+        except Exception as e:
+            logger.warning(f"Ping check/send failed: {e}")
+
     def find_latest_checkpoint_before(self, target_timestamp: int, checkpoints: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """
         Find the latest checkpoint with timestamp before the target timestamp
@@ -950,6 +978,25 @@ class ValsetVerifier:
             
         except Exception as e:
             logger.error(f"Failed to send Discord alert: {e}")
+
+    def generate_ping_content(self) -> str:
+        """Generate ping content summarizing valset validation status"""
+        try:
+            state = self.load_validation_state()
+            total = state.get('total_validations', 0)
+            last_tx = state.get('last_tx_hash', 'none')
+            last_block = state.get('last_block_number', 0)
+            last_time = state.get('last_validation_timestamp', 'Never')
+            return (
+                f"**Valset Verifier**\n"
+                f"**Total Validations:** {total}\n"
+                f"**Last Validated Tx:** `{last_tx}`\n"
+                f"**Last Block:** `{last_block}`\n"
+                f"**Last Validation Time:** {last_time}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to generate ping content: {e}")
+            return f"**Status:** Error generating ping content: {e}"
 
 def main():
     import argparse

@@ -26,6 +26,7 @@ import hashlib
 from eth_keys import keys
 from eth_utils import decode_hex
 from config_manager import get_config_manager
+from ping_helper import PingHelper
 
 # configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -89,6 +90,17 @@ class AttestVerifier:
                 logger.info("Discord alerts enabled")
             else:
                 logger.info("Discord alerts disabled (DISCORD_WEBHOOK_URL not set)")
+
+        # initialize ping helper (weekly by default)
+        try:
+            self.ping_frequency_days = 7
+            self.ping_helper = PingHelper(
+                script_name="attest_verifier",
+                data_dir=self.config_manager.get_data_dir(),
+                discord_webhook_url=self.discord_webhook_url
+            )
+        except Exception as e:
+            logger.warning(f"Failed to initialize PingHelper: {e}")
     
     def test_connection(self):
         """Test connection to Layer RPC"""
@@ -428,6 +440,25 @@ class AttestVerifier:
             
         except Exception as e:
             logger.error(f"Failed to send Discord alert: {e}")
+
+    def generate_ping_content(self) -> str:
+        """Generate ping content summarizing attestation validation status"""
+        try:
+            state = self.load_validation_state()
+            total = state.get('total_validations', 0)
+            last_tx = state.get('last_tx_hash', 'none')
+            last_block = state.get('last_block_number', 0)
+            last_time = state.get('last_validation_timestamp', 'Never')
+            return (
+                f"**Attestation Verifier**\n"
+                f"**Total Validations:** {total}\n"
+                f"**Last Validated Tx:** `{last_tx}`\n"
+                f"**Last Block:** `{last_block}`\n"
+                f"**Last Validation Time:** {last_time}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to generate ping content: {e}")
+            return f"**Status:** Error generating ping content: {e}"
     
     def decode_verify_oracle_data_calldata(self, input_data: str) -> Optional[Dict[str, Any]]:
         """
@@ -871,3 +902,11 @@ class AttestVerifier:
             logger.warning(f"🚨 {malicious_count} malicious attestations detected from valid validators!")
         if invalid_signature_count > 0:
             logger.info(f"🔒 {invalid_signature_count} attestations filtered out (invalid validator signatures)")
+
+        # scheduled weekly ping
+        try:
+            if getattr(self, 'ping_helper', None) and self.ping_helper.should_send_ping(self.ping_frequency_days):
+                ping_content = self.generate_ping_content()
+                self.ping_helper.send_ping(ping_content, self.ping_frequency_days)
+        except Exception as e:
+            logger.warning(f"Ping check/send failed: {e}")

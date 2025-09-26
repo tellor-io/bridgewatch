@@ -31,7 +31,7 @@ from ping_helper import PingHelper
 logger = logging.getLogger(__name__)
 
 class ValsetStaleAlerter:
-    def __init__(self, disable_discord: bool = False, bridge_contract_address: Optional[str] = None, 
+    def __init__(self, disable_discord: bool = False, stale_threshold_hours: int = 24 * 14, bridge_contract_address: Optional[str] = None, 
                  ping_frequency_days: int = 7):
         """Initialize the validator set stale alerter
         
@@ -54,7 +54,7 @@ class ValsetStaleAlerter:
             self.ping_frequency_days = ping_frequency_days
             
             # staleness threshold (2 weeks by default)
-            self.staleness_threshold_hours = 24 * 14
+            self.staleness_threshold_hours = stale_threshold_hours
             
             # initialize Web3
             self.w3 = Web3(Web3.HTTPProvider(self.evm_rpc_url))

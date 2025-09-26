@@ -11,9 +11,49 @@
       "description": "Ethereum to USD spot price"
     },
     {
+      "queryId": "0xd62f132d9d04dde6e223d4366c48b47cd9f90228acdc6fa755dab93266db5176",
+      "name": "SpotPrice(king,usd)",
+      "description": "KING to USD spot price"
+    },
+    {
+      "queryId": "0x0bc2d41117ae8779da7623ee76a109c88b84b9bf4d9b404524df04f7d0ca4ca7",
+      "name": "SpotPrice(reth,usd)",
+      "description": "rETH to USD spot price"
+    },
+    {
       "queryId": "0x74c9cfdfd2e4a00a9437bf93bf6051e18e604a976f3fa37faafe0bb5a039431d",
       "name": "SpotPrice(saga,usd)",
       "description": "SAGA to USD spot price"
+    },
+    {
+      "queryId": "0xab30caa3e7827a27c153063bce02c0b260b29c0c164040c003f0f9ec66002510",
+      "name": "SpotPrice(sfrxusd,usd)",
+      "description": "sfrxUSD to USD spot price"
+    },
+    {
+      "queryId": "0x611fd0e88850bf0cc036d96d04d47605c90b993485c2971e022b5751bbb04f23",
+      "name": "SpotPrice(statom,usd)",
+      "description": "stATOM to USD spot price"
+    },
+    {
+      "queryId": "0x03731257e35c49e44b267640126358e5decebdd8f18b5e8f229542ec86e318cf",
+      "name": "SpotPrice(susde,usd)",
+      "description": "sUSDe to USD spot price"
+    },
+    {
+      "queryId": "0xa396062006158d539a9b57c2049a936ba947bbdeecc1058235c45b21d23ecc57",
+      "name": "SpotPrice(susdn,usd)",
+      "description": "sUSDN to USD spot price"
+    },
+    {
+      "queryId": "0x59ae85cec665c779f18255dd4f3d97821e6a122691ee070b9a26888bc2a0e45a",
+      "name": "SpotPrice(susds,usd)",
+      "description": "sUSDS to USD spot price"
+    },
+    {
+      "queryId": "0x76b504e33305a63a3b80686c0b7bb99e7697466927ba78e224728e80bfaaa0be",
+      "name": "SpotPrice(tbtc,usd)",
+      "description": "tBTC to USD spot price"
     },
     {
       "queryId": "0x8ee44cd434ed5b0e007eee581fbe0855336f3f84484e8d9989a620a4a49aa0f7",
@@ -21,16 +61,31 @@
       "description": "USDC to USD spot price"
     },
     {
+      "queryId": "0xe010d752f28dcd2804004d0b57ab1bdc4eca092895d49160204120af11d15f3e",
+      "name": "SpotPrice(usdn,usd)",
+      "description": "USDN to USD spot price"
+    },
+    {
       "queryId": "0x68a37787e65e85768d4aa6e385fb15760d46df0f67a18ec032d8fd5848aca264",
       "name": "SpotPrice(usdt,usd)",
       "description": "USDT to USD spot price"
     },
     {
-      "queryId": "0xc444759b83c7bb0f6694306e1f719e65679d48ad754a31d3a366856becf1e71e",
-      "name": "SpotPrice(fbtc,usd)",
-      "description": "FBTC to USD spot price"
+      "queryId": "0x91513b15db3cef441d52058b24412957f9cc8645c53aecf39446ac9b0d2dcca4",
+      "name": "SpotPrice(vyusd,usd)",
+      "description": "vyUSD to USD spot price"
+    },
+    {
+      "queryId": "0x1962cde2f19178fe2bb2229e78a6d386e6406979edc7b9a1966d89d83b3ebf2e",
+      "name": "SpotPrice(wsteth,usd)",
+      "description": "wstETH to USD spot price"
+    },
+    {
+      "queryId": "0x35155b44678db9e9e021c2cf49dd20c31b49e03415325c2beffb5221cf63882d",
+      "name": "SpotPrice(yusd,usd)",
+      "description": "yUSD to USD spot price"
     }
   ],
   "staleness_threshold_hours": 16,
   "monitoring_interval_minutes": 10
-} 
+}
