@@ -6,8 +6,14 @@
       "evm_chain": "eth-mainnet", 
       "bridge_contract": "0xFfa3393BE1E4b442fff6cD0df0794B0031e9CF65",
       "databank_contract": "0x0000000000000000000000000000000000000000",
-      "layer_rpc_url": "https://mainnet.tellorlayer.com",
-      "evm_rpc_url": "${EVM_RPC_URL_MAINNET}",
+      "layer_rpc_urls": [
+        "http://localhost:1317/",
+        "https://mainnet.tellorlayer.com"
+      ],
+      "evm_rpc_urls": [
+        "https://mainnet.infura.io/v3/${INFURA_API_KEY}",
+        "https://eth-mainnet.alchemyapi.io/v2/${ALCHEMY_API_KEY}"
+      ],
       "discord_webhook_url": "${DISCORD_WEBHOOK_URL_MAINNET}",
       "discord_webhooks": {
         "malicious_activity": "${DISCORD_WEBHOOK_URL_MAINNET}",
@@ -26,6 +32,10 @@
       "databank_contract": "0x0000000000000000000000000000000000000000",
       "layer_rpc_url": "https://node-palmito.tellorlayer.com",
       "evm_rpc_url": "${EVM_RPC_URL_SEPOLIA}",
+      "evm_rpc_urls": [
+        "https://sepolia.infura.io/v3/${INFURA_API_KEY}",
+        "https://eth-sepolia.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
+      ],
       "discord_webhook_url": "${DISCORD_WEBHOOK_URL_SEPOLIA}",
       "discord_webhooks": {
         "malicious_activity": "${DISCORD_WEBHOOK_URL_SEPOLIA}",

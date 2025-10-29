@@ -6,7 +6,7 @@ This component generates periodic reports on TellorDataBank data feed activity,
 showing the number of relayed reports per queryId over specified time periods.
 
 Features:
-- Generates weekly reports by default (Tuesdays at 9am ET)
+- Generates daily reports by default (every day at 9am ET)
 - Counts relayed reports per queryId from TellorDataBank contract
 - Sends consolidated Discord reports for all feeds
 - Supports custom time periods and immediate report generation
@@ -160,11 +160,11 @@ class FrequencyMonitor:
         return f"{utc_str} ({eastern_str})"
     
     def _is_report_time(self) -> bool:
-        """Check if it's time to send the weekly report (Tuesday 9am ET)"""
+        """Check if it's time to send the daily report (every day at 9am ET)"""
         now_et = datetime.now(self.eastern_tz)
         
-        # Check if it's Tuesday (weekday 1) and 9am ET
-        if now_et.weekday() == 1 and now_et.hour == 9:
+        # Check if it's 9am ET (any day of the week)
+        if now_et.hour == 9 and now_et.minute < 5:  # 5-minute window to avoid multiple reports
             return True
         
         return False
@@ -340,7 +340,7 @@ class FrequencyMonitor:
         except Exception as e:
             logger.error(f"Failed to send Discord report: {e}")
     
-    def run_once(self, days: int = 7, force_report: bool = False) -> Optional[Dict[str, Any]]:
+    def run_once(self, days: int = 1, force_report: bool = False) -> Optional[Dict[str, Any]]:
         """Run frequency check once and optionally send report
         
         Args:
@@ -368,7 +368,7 @@ class FrequencyMonitor:
             logger.debug("Not time for scheduled report, skipping")
             return None
     
-    def run_continuous(self, interval_minutes: int = 60, days: int = 7):
+    def run_continuous(self, interval_minutes: int = 60, days: int = 1):
         """Run continuous monitoring with specified interval
         
         Args:
@@ -378,7 +378,7 @@ class FrequencyMonitor:
         interval_seconds = interval_minutes * 60
         
         logger.info(f"Starting continuous frequency monitoring (interval: {interval_minutes}m, report period: {days}d)")
-        logger.info("Weekly reports scheduled for Tuesdays at 9am ET")
+        logger.info("Daily reports scheduled for 9am ET every day")
         
         try:
             while True:
@@ -403,7 +403,7 @@ def main():
     parser.add_argument('--no-discord', action='store_true', help='Disable Discord reports')
     parser.add_argument('--databank-address', type=str, help='Override TellorDataBank contract address')
     parser.add_argument('--interval', type=int, default=60, help='Monitoring interval in minutes (default: 60)')
-    parser.add_argument('--days', type=int, default=7, help='Report period in days (default: 7)')
+    parser.add_argument('--days', type=int, default=1, help='Report period in days (default: 1)')
     parser.add_argument('--report-now', action='store_true', help='Generate and send report immediately')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose debug logging')
     parser.add_argument('--config', type=str, help='Specify which configuration profile to use (overrides ACTIVE_CONFIG)')
