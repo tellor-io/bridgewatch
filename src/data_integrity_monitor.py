@@ -26,26 +26,30 @@ import pytz
 from pathlib import Path
 from config_manager import get_config_manager
 from logger_utils import setup_logging
+from ping_helper import PingHelper
+from rpc_failover import EVMProviderPool, HttpEndpointPool
 
 # logging will be configured in main() based on --verbose flag
 logger = logging.getLogger(__name__)
 
 class DataIntegrityMonitor:
-    def __init__(self, disable_discord: bool = False, databank_contract_address: Optional[str] = None):
+    def __init__(self, disable_discord: bool = False, databank_contract_address: Optional[str] = None,
+                 ping_frequency_days: int = 7):
         """Initialize the data integrity monitor
         
         Args:
             disable_discord: If True, skip sending Discord alerts
             databank_contract_address: Override TellorDataBank contract address
+            ping_frequency_days: Ping frequency in days (7=weekly, 1=daily, etc.)
         """
         try:
             self.config_manager = get_config_manager()
             
             # get configuration
             self.bridge_contract_address = self.config_manager.get_bridge_contract()
-            self.evm_rpc_url = self.config_manager.get_evm_rpc_url()
+            self.evm_rpc_urls = self.config_manager.get_evm_rpc_urls()
             self.layer_chain = self.config_manager.get_layer_chain()
-            self.layer_rpc_url = self.config_manager.get_layer_rpc_url()
+            self.layer_rpc_urls = self.config_manager.get_layer_rpc_urls()
             self.evm_chain = self.config_manager.get_evm_chain()
             
             # use provided databank address or derive from config
@@ -53,19 +57,23 @@ class DataIntegrityMonitor:
             
             # store settings
             self.disable_discord = disable_discord
+            self.ping_frequency_days = ping_frequency_days
             
-            # initialize Web3
-            self.w3 = Web3(Web3.HTTPProvider(self.evm_rpc_url))
-            
-            # test connection
+            # initialize provider pools
+            reset_minutes = self.config_manager.get_rpc_preference_reset_minutes()
+            self.evm_pool = EVMProviderPool(self.evm_rpc_urls, request_timeout_s=15, preference_reset_minutes=reset_minutes)
+            self.layer_pool = HttpEndpointPool(self.layer_rpc_urls, timeout_s=10, preference_reset_minutes=reset_minutes)
+
+            # test EVM connection
             try:
-                latest_block = self.w3.eth.block_number
+                w3 = self.evm_pool.ensure_connected()
+                latest_block = w3.eth.block_number
                 logger.debug(f"Connected to EVM RPC. Latest block: {latest_block}")
             except Exception as e:
-                raise ConnectionError(f"Failed to connect to EVM RPC: {e}")
+                raise ConnectionError(f"Failed to connect to any EVM RPC: {e}")
             
-            # load databank contract
-            self.databank_contract = self._load_databank_contract()
+            # load databank ABI
+            self.databank_abi = self._load_databank_abi()
             
             # load query IDs configuration (same as feed stale monitor)
             self.feeds_config = self._load_feeds_config()
@@ -85,9 +93,16 @@ class DataIntegrityMonitor:
             self.state_file = validation_dir / "data_integrity_state.json"
             self.last_checked_indices = self._load_state()
             
+            # initialize ping helper
+            self.ping_helper = PingHelper(
+                script_name="data_integrity_monitor",
+                data_dir=data_dir,
+                discord_webhook_url=self.discord_webhook_url
+            )
+            
             logger.info(f"Initialized DataIntegrityMonitor for {self.layer_chain} → {self.evm_chain}")
             logger.info(f"DataBank contract: {self.databank_contract_address}")
-            logger.info(f"Layer RPC: {self.layer_rpc_url}")
+            logger.info(f"Layer RPC: {self.config_manager.get_layer_rpc_url()}")
             logger.info(f"Monitoring {len(self.feeds_config['feeds'])} feeds for data integrity")
             logger.info(f"Monitoring interval: {self.feeds_config['monitoring_interval_minutes']} minutes")
             
@@ -107,24 +122,33 @@ class DataIntegrityMonitor:
             raise ValueError("TellorDataBank contract address not configured. Please set 'databank_contract' in config.json or use --databank-address")
         return databank_address
     
-    def _load_databank_contract(self):
-        """Load the TellorDataBank contract ABI and create Web3 contract instance"""
+    def _load_databank_abi(self):
+        """Load the TellorDataBank contract ABI"""
         try:
             abi_path = "abis/TellorDataBank.json"
             with open(abi_path, 'r') as f:
                 contract_data = json.load(f)
-            
-            contract = self.w3.eth.contract(
-                address=self.databank_contract_address,
-                abi=contract_data['abi']
-            )
-            
-            logger.debug(f"Loaded TellorDataBank contract from {abi_path}")
-            return contract
-            
+            logger.debug(f"Loaded TellorDataBank ABI from {abi_path}")
+            return contract_data['abi']
         except Exception as e:
-            logger.error(f"Failed to load TellorDataBank contract: {e}")
+            logger.error(f"Failed to load TellorDataBank ABI: {e}")
             raise
+    
+    def _call_get_aggregate_value_count(self, query_id: str):
+        """Call getAggregateValueCount via EVM provider pool with failover"""
+        return self.evm_pool.with_contract_call(
+            address=self.databank_contract_address,
+            abi=self.databank_abi,
+            fn_builder=lambda c: c.functions.getAggregateValueCount(query_id).call()
+        )
+    
+    def _call_get_aggregate_by_index(self, query_id: str, index: int):
+        """Call getAggregateByIndex via EVM provider pool with failover"""
+        return self.evm_pool.with_contract_call(
+            address=self.databank_contract_address,
+            abi=self.databank_abi,
+            fn_builder=lambda c: c.functions.getAggregateByIndex(query_id, index).call()
+        )
     
     def _load_feeds_config(self) -> Dict[str, Any]:
         """Load feeds configuration from query_ids.json"""
@@ -146,10 +170,10 @@ class DataIntegrityMonitor:
     def _get_data_integrity_discord_webhook(self) -> Optional[str]:
         """Get Discord webhook URL for data integrity alerts"""
         try:
-            # try to get from discord_webhooks configuration first
-            webhooks = self.config_manager.get_discord_webhooks()
-            if webhooks and 'malicious_activity' in webhooks:
-                return webhooks['malicious_activity']
+            # try to get specific valset_stale webhook first
+            webhook_url = self.config_manager.get_discord_webhook('malicious_activity')
+            if webhook_url and webhook_url != "N/A":
+                return webhook_url
             
             # fallback to general discord webhook
             return self.config_manager.get_discord_webhook_url()
@@ -185,7 +209,7 @@ class DataIntegrityMonitor:
     def _initialize_feed_state(self, query_id: str) -> int:
         """Initialize state for a new feed by checking past 48 hours of data"""
         try:
-            current_count = self.databank_contract.functions.getAggregateValueCount(query_id).call()
+            current_count = self._call_get_aggregate_value_count(query_id)
             
             if current_count == 0:
                 logger.info(f"No data found for feed {query_id}")
@@ -201,7 +225,7 @@ class DataIntegrityMonitor:
             # look backwards through indices to find first entry older than 48 hours
             for index in range(current_count - 1, -1, -1):
                 try:
-                    aggregate_data = self.databank_contract.functions.getAggregateByIndex(query_id, index).call()
+                    aggregate_data = self._call_get_aggregate_by_index(query_id, index)
                     aggregate_timestamp = aggregate_data[2]  # aggregateTimestamp
                     
                     if aggregate_timestamp == 0:
@@ -241,18 +265,17 @@ class DataIntegrityMonitor:
             else:
                 query_id_clean = query_id
             
-            url = f"{self.layer_rpc_url}/tellor-io/layer/oracle/retrieve_data/{query_id_clean}/{timestamp}"
+            path = f"/tellor-io/layer/oracle/retrieve_data/{query_id_clean}/{timestamp}"
+            logger.debug(f"Querying Layer API path: {path}")
+            data = self.layer_pool.get_json(path)
             
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
+            if data:
+                logger.debug(f"Retrieved data from Layer for {query_id} at {timestamp}")
+                return data
+            else:
+                logger.error(f"Failed to query Tellor Layer for {query_id} at {timestamp}")
+                return None
             
-            data = response.json()
-            logger.debug(f"Retrieved data from Layer for {query_id} at {timestamp}")
-            return data
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to query Tellor Layer for {query_id} at {timestamp}: {e}")
-            return None
         except Exception as e:
             logger.error(f"Error processing Layer response for {query_id} at {timestamp}: {e}")
             return None
@@ -305,7 +328,7 @@ class DataIntegrityMonitor:
         
         try:
             # get current count
-            current_count = self.databank_contract.functions.getAggregateValueCount(query_id).call()
+            current_count = self._call_get_aggregate_value_count(query_id)
             
             # initialize if this is the first time we're checking this feed
             if query_id not in self.last_checked_indices:
@@ -324,7 +347,7 @@ class DataIntegrityMonitor:
             for index in range(last_checked + 1, current_count):
                 try:
                     # get data from DataBank
-                    aggregate_data = self.databank_contract.functions.getAggregateByIndex(query_id, index).call()
+                    aggregate_data = self._call_get_aggregate_by_index(query_id, index)
                     # aggregate_data tuple: (value, power, aggregateTimestamp, attestationTimestamp, relayTimestamp)
                     databank_value = aggregate_data[0]  # bytes value
                     aggregate_timestamp = aggregate_data[2]  # uint256 timestamp in milliseconds
@@ -391,6 +414,47 @@ class DataIntegrityMonitor:
         
         return violations
     
+    def generate_ping_content(self) -> str:
+        """Generate ping content with current monitoring status"""
+        try:
+            ping_content = (
+                f"**Monitoring Data Integrity:**\n"
+                f"**DataBank Contract:** `{self.databank_contract_address}`\n"
+                f"**Chain:** {self.evm_chain}\n"
+                f"**Feeds Monitored:** {len(self.feeds_config['feeds'])}\n\n"
+                f"**Last Checked Report for Each Feed:**\n"
+            )
+            
+            for feed in self.feeds_config['feeds']:
+                query_id = feed['queryId']
+                feed_name = feed['name']
+                
+                try:
+                    # get last checked index for this feed
+                    last_index = self.last_checked_indices.get(query_id, -1)
+                    
+                    if last_index >= 0:
+                        # get the data for this index to show timestamp
+                        aggregate_data = self._call_get_aggregate_by_index(query_id, last_index)
+                        aggregate_timestamp = aggregate_data[2]  # aggregateTimestamp
+                        
+                        if aggregate_timestamp > 0:
+                            formatted_time = self.ping_helper.format_timestamp_et(aggregate_timestamp)
+                            ping_content += f"**{feed_name}:** Index {last_index}, {aggregate_timestamp} ({formatted_time})\n"
+                        else:
+                            ping_content += f"**{feed_name}:** Index {last_index}, No timestamp\n"
+                    else:
+                        ping_content += f"**{feed_name}:** Not yet checked\n"
+                        
+                except Exception as e:
+                    ping_content += f"**{feed_name}:** Error getting last checked data\n"
+            
+            return ping_content
+            
+        except Exception as e:
+            logger.error(f"Failed to generate ping content: {e}")
+            return f"**Status:** Error generating ping content: {e}"
+
     def send_discord_alert(self, violation: Dict[str, Any]):
         """Send Discord alert for data integrity violation"""
         if self.disable_discord or not self.discord_webhook_url:
@@ -466,7 +530,7 @@ class DataIntegrityMonitor:
         
         return all_violations
     
-    def run_once(self) -> List[Dict[str, Any]]:
+    def run_once(self, send_ping: bool = False) -> List[Dict[str, Any]]:
         """Run data integrity check once and return results"""
         logger.info("Running data integrity check...")
         
@@ -487,9 +551,14 @@ class DataIntegrityMonitor:
         # save state after check
         self._save_state()
         
+        # check for scheduled ping
+        if self.ping_helper.should_send_ping(self.ping_frequency_days) or send_ping:
+            ping_content = self.generate_ping_content()
+            self.ping_helper.send_ping(ping_content, self.ping_frequency_days, force=send_ping)
+        
         return violations
     
-    def run_continuous(self):
+    def run_continuous(self, send_initial_ping: bool = False):
         """Run continuous monitoring with configured interval"""
         interval_minutes = self.feeds_config['monitoring_interval_minutes']
         interval_seconds = interval_minutes * 60
@@ -497,9 +566,13 @@ class DataIntegrityMonitor:
         logger.info(f"Starting continuous data integrity monitoring (interval: {interval_minutes}m)")
         
         try:
+            # First run - check if we should send initial ping
+            first_run = True
             while True:
                 try:
-                    self.run_once()
+                    send_ping_now = send_initial_ping and first_run
+                    self.run_once(send_ping=send_ping_now)
+                    first_run = False
                 except Exception as e:
                     logger.error(f"Error during monitoring cycle: {e}")
                 
@@ -518,28 +591,41 @@ def main():
     parser.add_argument('--once', action='store_true', help='Run once instead of continuously')
     parser.add_argument('--no-discord', action='store_true', help='Disable Discord alerts')
     parser.add_argument('--databank-address', type=str, help='Override TellorDataBank contract address')
+    parser.add_argument('--ping-frequency', type=int, default=7, help='Ping frequency in days (default: 7)')
+    parser.add_argument('--ping-now', action='store_true', help='Send ping immediately')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose debug logging')
+    parser.add_argument('--config', type=str, help='Specify which configuration profile to use (overrides ACTIVE_CONFIG)')
     
     args = parser.parse_args()
     
+    # set config override if --config flag was provided
+    if args.config:
+        from config import set_global_config_override
+        set_global_config_override(args.config)
+    
     # setup logging based on verbose flag
     setup_logging(verbose=args.verbose)
+    
+    # log which config we're using if override was provided
+    if args.config:
+        logger.info(f"🔧 Using configuration: {args.config}")
     
     try:
         # initialize monitor
         monitor = DataIntegrityMonitor(
             disable_discord=args.no_discord,
-            databank_contract_address=args.databank_address
+            databank_contract_address=args.databank_address,
+            ping_frequency_days=args.ping_frequency
         )
         
         if args.once:
             # run once
-            violations = monitor.run_once()
+            violations = monitor.run_once(send_ping=args.ping_now)
             if violations:
                 exit(1)  # exit with error code if violations found
         else:
             # run continuously
-            monitor.run_continuous()
+            monitor.run_continuous(send_initial_ping=args.ping_now)
             
     except Exception as e:
         logger.error(f"Monitor failed: {e}")

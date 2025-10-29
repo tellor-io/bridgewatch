@@ -1,0 +1,93 @@
+{
+  "contracts": [
+    {
+      "address": "0x24cC4cFbfBAd68603612B1efd908484b5258d8E8",
+      "description": "ATOM/USD"
+    },
+    {
+      "address": "0xe7a6046a46ce932CbcD44D284f2B4C4e841457e4",
+      "description": "BTC/USD"
+    },
+    {
+      "address": "0xf568a35f0D1D4C0a389bB29033a0f13E02536D62",
+      "description": "ETH/USD"
+    },
+    {
+      "address": "0xd7a5261039648B1780a5b11fA5042370deA12C37",
+      "description": "fBTC/USD"
+    },
+    {
+      "address": "0x54cb7d1c225100B05720d37735316BF16D885496",
+      "description": "KING/USD"
+    },
+    {
+      "address": "0xa2e5E28F3cA88e7Cc4f046dba2029eA8F44A6796",
+      "description": "rETH/USD"
+    },
+    {
+      "address": "0xB4eA7fc3359E390CADcee542bDbd34caB89E64f0",
+      "description": "SAGA/USD"
+    },
+    {
+      "address": "0x457fC8f0D3E7319eb078E076afD3F49120Bd0c4a",
+      "description": "stATOM/USD"
+    },
+    {
+      "address": "0xda8abCd7e972789d18537Fb1E747eEF29F8710eA",
+      "description": "sUSDe/USD"
+    },
+    {
+      "address": "0x9a6e4192bc7B6c84D51276541096f1565b4e92Ae",
+      "description": "sUSDS/USD"
+    },
+    {
+      "address": "0x987fc3b27226427323EFDB73E713669cf87B588c",
+      "description": "tBTC/USD"
+    },
+    {
+      "address": "0xa04Bf6AEDCc24c16D243E39a5b35443A749c2349",
+      "description": "USDC/USD"
+    },
+    {
+      "address": "0x7C42Ab8a4c44793D495AB9829c0E72f1404e57ac",
+      "description": "USDN/USD"
+    },
+    {
+      "address": "0x23386534d60AE5ECCc4fE84065B264CFD8522204",
+      "description": "USDT/USD"
+    },
+    {
+      "address": "0x077488484e2A76E3FC20C101691D7a725D2D1cDA",
+      "description": "wstETH/USD"
+    },
+    {
+      "address": "0xB3EF672462111BF0a487f62D2A8C405B430bdeDF",
+      "description": "yUSD/USD"
+    },
+    {
+      "address": "0x43790B86579CBE3f6b5A1D470777E55363F9f8F0",
+      "description": "vyUSD/USD"
+    },
+    {
+      "address": "0xDff5F0aE4C062EF32E170EeB8dc0f30CBeDB505f",
+      "description": "sfrxUSD/USD"
+    },
+    {
+      "address": "0x4458F3c67f4131D297F2f4c1D56c40F93aE3Cd2C",
+      "description": "sUSN/USD"
+    },
+    {
+      "address": "0x729Eb2BE0a940cFc2fBf58D7f4212DC98F2D4B77",
+      "description": "MUST/USD"
+    },
+    {
+      "address": "0x4b3bdd84B38DaFd455769E0cf81eBD0f1789Cf3D",
+      "description": "sMUST/USD"
+    },
+    {
+      "address": "0xE087D1936257444ec4bc34caD95cA58EE0129a7e",
+      "description": "yETH/USD"
+    }
+  ],
+  "monitoring_interval_minutes": 5
+} 

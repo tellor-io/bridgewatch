@@ -1,77 +1,91 @@
 #!/usr/bin/env python3
 """
-Valset Stale Alerter
+Validator Set Stale Alerter
 
-This component monitors the validator timestamp in the bridge contract and sends 
-Discord alerts when the validator set becomes too old (stale).
+This component monitors TellorDataBridge contracts for stale validator sets
+by checking if the validatorTimestamp is older than a configured threshold.
 
 Features:
-- Queries validatorTimestamp() from the bridge contract
-- Checks if timestamp is older than configurable threshold
-- Sends Discord alerts when validator set is stale
-- Configurable stale threshold (default: 2 weeks)
-- Supports run-once and continuous monitoring modes
+- Monitors validatorTimestamp for staleness
+- Configurable staleness threshold
+- Sends Discord alerts for stale validator sets
+- Shows both millisecond and human-readable timestamps
+- Weekly ping functionality
 """
 
 import time
 import requests
 import logging
-from datetime import datetime, timedelta
-from typing import Optional
-from web3 import Web3
 import json
+import argparse
+from datetime import datetime
+from typing import Optional, Dict, Any
+from web3 import Web3
 import pytz
+from pathlib import Path
 from config_manager import get_config_manager
+from logger_utils import setup_logging
+from ping_helper import PingHelper
 
-# configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# logging will be configured in main() based on --verbose flag
 logger = logging.getLogger(__name__)
 
 class ValsetStaleAlerter:
-    def __init__(self, disable_discord: bool = False, stale_threshold_hours: int = 336):  # 2 weeks default
-        """Initialize the valset stale alerter
+    def __init__(self, disable_discord: bool = False, stale_threshold_hours: int = 24 * 14, bridge_contract_address: Optional[str] = None, 
+                 ping_frequency_days: int = 7):
+        """Initialize the validator set stale alerter
         
         Args:
             disable_discord: If True, skip sending Discord alerts
-            stale_threshold_hours: Hours after which validator set is considered stale (default: 336 = 2 weeks)
+            bridge_contract_address: Override TellorDataBridge contract address
+            ping_frequency_days: Ping frequency in days (7=weekly, 1=daily, etc.)
         """
         try:
             self.config_manager = get_config_manager()
             
             # get configuration
-            self.bridge_contract_address = self.config_manager.get_bridge_contract()
+            self.bridge_contract_address = bridge_contract_address or self.config_manager.get_bridge_contract()
             self.evm_rpc_url = self.config_manager.get_evm_rpc_url()
             self.layer_chain = self.config_manager.get_layer_chain()
             self.evm_chain = self.config_manager.get_evm_chain()
             
             # store settings
             self.disable_discord = disable_discord
-            self.stale_threshold_hours = stale_threshold_hours
-            self.stale_threshold_ms = stale_threshold_hours * 60 * 60 * 1000  # convert to milliseconds
+            self.ping_frequency_days = ping_frequency_days
+            
+            # staleness threshold (2 weeks by default)
+            self.staleness_threshold_hours = stale_threshold_hours
             
             # initialize Web3
             self.w3 = Web3(Web3.HTTPProvider(self.evm_rpc_url))
             
-            # test connection by trying to get latest block
+            # test connection
             try:
                 latest_block = self.w3.eth.block_number
                 logger.debug(f"Connected to EVM RPC. Latest block: {latest_block}")
             except Exception as e:
                 raise ConnectionError(f"Failed to connect to EVM RPC: {e}")
             
-            # load bridge contract ABI and create contract instance
+            # load bridge contract
             self.bridge_contract = self._load_bridge_contract()
             
-            # get Discord webhook URL (unless disabled)
-            self.discord_webhook_url = None if disable_discord else self._get_stale_valset_discord_webhook()
+            # get Discord webhook URL
+            self.discord_webhook_url = None if disable_discord else self._get_valset_discord_webhook()
             
-            # set up timezone for human-readable timestamps
-            self.utc_tz = pytz.timezone('UTC')
+            # set up timezone
             self.eastern_tz = pytz.timezone('US/Eastern')
+            
+            # initialize ping helper
+            data_dir = self.config_manager.get_data_dir()
+            self.ping_helper = PingHelper(
+                script_name="valset_stale_alerter",
+                data_dir=data_dir,
+                discord_webhook_url=self.discord_webhook_url
+            )
             
             logger.info(f"Initialized ValsetStaleAlerter for {self.layer_chain} → {self.evm_chain}")
             logger.info(f"Bridge contract: {self.bridge_contract_address}")
-            logger.info(f"Stale threshold: {stale_threshold_hours} hours ({self.stale_threshold_hours/24:.1f} days)")
+            logger.info(f"Staleness threshold: {self.staleness_threshold_hours} hours")
             
             if self.disable_discord:
                 logger.warning("Discord alerts: DISABLED via --no-discord flag")
@@ -83,278 +97,211 @@ class ValsetStaleAlerter:
             raise
     
     def _load_bridge_contract(self):
-        """Load the bridge contract ABI and create Web3 contract instance"""
+        """Load the TellorDataBridge contract ABI and create Web3 contract instance"""
         try:
-            # load ABI from file
             abi_path = "abis/TellorDataBridge.json"
             with open(abi_path, 'r') as f:
                 contract_data = json.load(f)
             
-            # create contract instance
             contract = self.w3.eth.contract(
                 address=self.bridge_contract_address,
                 abi=contract_data['abi']
             )
             
-            logger.debug(f"Loaded bridge contract from {abi_path}")
+            logger.debug(f"Loaded TellorDataBridge contract from {abi_path}")
             return contract
             
         except Exception as e:
-            logger.error(f"Failed to load bridge contract: {e}")
+            logger.error(f"Failed to load TellorDataBridge contract: {e}")
             raise
     
-    def _get_stale_valset_discord_webhook(self) -> Optional[str]:
-        """Get the Discord webhook URL for stale validator set alerts"""
-        # try new discord_webhooks structure first 
-        webhooks = self.config_manager.get_active_config().get('discord_webhooks', {})
-        if 'valset_stale' in webhooks:
-            return webhooks['valset_stale']
-        
-        # fallback to valset_updates webhook
-        if 'valset_updates' in webhooks:
-            logger.info("Using valset_updates webhook for stale alerts (consider configuring discord_webhooks.valset_stale)")
-            return webhooks['valset_updates']
-        
-        # fallback to legacy webhook (with warning)
-        legacy_webhook = self.config_manager.get_discord_webhook_url()
-        if legacy_webhook:
-            logger.warning("Using legacy discord_webhook_url for stale alerts. Consider updating config to use discord_webhooks.valset_stale")
-            return legacy_webhook
-        
-        # try environment variable
-        import os
-        env_webhook = os.getenv('DISCORD_WEBHOOK_VALSET_STALE_URL')
-        if env_webhook:
-            return env_webhook
-            
-        logger.warning("No Discord webhook configured for stale valset alerts")
-        return None
-    
-    def get_validator_timestamp(self) -> Optional[int]:
-        """Get the current validator timestamp from the bridge contract"""
+    def _get_valset_discord_webhook(self) -> Optional[str]:
+        """Get Discord webhook URL for validator set alerts"""
         try:
-            # call validatorTimestamp() function
-            timestamp = self.bridge_contract.functions.validatorTimestamp().call()
-            logger.debug(f"Current validator timestamp: {timestamp}")
-            return timestamp
+            # try to get specific valset_stale webhook first
+            webhook_url = self.config_manager.get_discord_webhook('valset_stale')
+            if webhook_url and webhook_url != "N/A":
+                return webhook_url
+            
+            # fallback to general discord webhook
+            return self.config_manager.get_discord_webhook_url()
             
         except Exception as e:
-            logger.error(f"Failed to get validator timestamp from bridge contract: {e}")
+            logger.warning(f"Could not get Discord webhook URL: {e}")
             return None
     
-    def is_validator_set_stale(self, validator_timestamp: int) -> tuple[bool, timedelta]:
-        """Check if validator set is stale
-        
-        Returns:
-            tuple: (is_stale: bool, age: timedelta)
-        """
-        try:
-            # current time in milliseconds
-            current_time_ms = int(datetime.utcnow().timestamp() * 1000)
-            
-            # calculate age
-            age_ms = current_time_ms - validator_timestamp
-            age = timedelta(milliseconds=age_ms)
-            
-            # check if stale
-            is_stale = age_ms > self.stale_threshold_ms
-            
-            logger.debug(f"Validator set age: {age}, threshold: {timedelta(hours=self.stale_threshold_hours)}, stale: {is_stale}")
-            return is_stale, age
-            
-        except Exception as e:
-            logger.error(f"Failed to check if validator set is stale: {e}")
-            return False, timedelta()
+    def _format_timestamp(self, timestamp_ms: int) -> str:
+        """Format timestamp in milliseconds to human-readable ET string"""
+        return self.ping_helper.format_timestamp_et(timestamp_ms)
     
-    def format_timestamp(self, timestamp_ms: int) -> str:
-        """Format timestamp for display"""
+    def get_validator_set_info(self) -> Optional[Dict[str, Any]]:
+        """Get current validator set information from bridge contract"""
         try:
-            dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=self.utc_tz)
-            eastern = dt.astimezone(self.eastern_tz)
-            return eastern.strftime('%Y-%m-%d %H:%M:%S %Z')
-        except Exception:
-            return f"Invalid timestamp: {timestamp_ms}"
-    
-    def send_stale_alert(self, validator_timestamp: int, age: timedelta) -> bool:
-        """Send Discord alert for stale validator set"""
-        if self.disable_discord:
-            logger.debug("Discord alerts disabled via --no-discord flag, skipping alert")
-            return False
+            validator_timestamp = self.bridge_contract.functions.validatorTimestamp().call()
+            validator_set_checkpoint = self.bridge_contract.functions.lastValidatorSetCheckpoint().call()
+            power_threshold = self.bridge_contract.functions.powerThreshold().call()
             
-        if not self.discord_webhook_url:
-            logger.debug("No Discord webhook configured, skipping alert")
-            return False
-        
-        try:
-            # format timestamp
-            timestamp_str = self.format_timestamp(validator_timestamp)
-            
-            # calculate days and hours
-            total_hours = int(age.total_seconds() // 3600)
-            days = total_hours // 24
-            hours = total_hours % 24
-            
-            age_str = f"{days} days, {hours} hours" if days > 0 else f"{hours} hours"
-            
-            # create Discord embed
-            embed = {
-                "title": "⚠️ STALE VALIDATOR SET DETECTED",
-                "description": f"Validator set in {self.layer_chain} → {self.evm_chain} bridge is stale and needs updating",
-                "color": 0xFFA500,  # orange
-                "fields": [
-                    {
-                        "name": "🕒 Validator Set Timestamp",
-                        "value": f"`{validator_timestamp:,}` ms\n{timestamp_str}",
-                        "inline": True
-                    },
-                    {
-                        "name": "⏰ Age",
-                        "value": f"**{age_str}**",
-                        "inline": True
-                    },
-                    {
-                        "name": "📏 Threshold",
-                        "value": f"{self.stale_threshold_hours} hours ({self.stale_threshold_hours/24:.1f} days)",
-                        "inline": True
-                    },
-                    {
-                        "name": "🔗 Bridge Contract",
-                        "value": f"`{self.bridge_contract_address}`",
-                        "inline": False
-                    },
-                    {
-                        "name": "⚠️ Action Required",
-                        "value": "The validator set should be updated to maintain bridge security",
-                        "inline": False
-                    }
-                ],
-                "footer": {
-                    "text": f"Bridge: {self.layer_chain} → {self.evm_chain}"
-                },
-                "timestamp": datetime.utcnow().isoformat()
+            return {
+                'validator_timestamp': validator_timestamp,
+                'validator_set_checkpoint': validator_set_checkpoint.hex(),
+                'power_threshold': power_threshold,
+                'formatted_timestamp': self._format_timestamp(validator_timestamp)
             }
             
+        except Exception as e:
+            logger.error(f"Failed to get validator set info: {e}")
+            return None
+    
+    def check_valset_staleness(self) -> Optional[Dict[str, Any]]:
+        """Check if validator set is stale"""
+        try:
+            valset_info = self.get_validator_set_info()
+            if not valset_info:
+                return None
+            
+            validator_timestamp = valset_info['validator_timestamp']
+            current_time_ms = int(time.time() * 1000)
+            
+            # calculate age in hours
+            age_ms = current_time_ms - validator_timestamp
+            age_hours = age_ms / (1000 * 60 * 60)
+            
+            if age_hours > self.staleness_threshold_hours:
+                logger.warning(f"Validator set is stale: {age_hours:.1f}h old (threshold: {self.staleness_threshold_hours}h)")
+                return {
+                    'is_stale': True,
+                    'age_hours': age_hours,
+                    'threshold_hours': self.staleness_threshold_hours,
+                    'valset_info': valset_info
+                }
+            else:
+                logger.debug(f"Validator set is fresh: {age_hours:.1f}h old")
+                return {
+                    'is_stale': False,
+                    'age_hours': age_hours,
+                    'threshold_hours': self.staleness_threshold_hours,
+                    'valset_info': valset_info
+                }
+                
+        except Exception as e:
+            logger.error(f"Error checking validator set staleness: {e}")
+            return None
+    
+    def send_discord_alert(self, staleness_result: Dict[str, Any]):
+        """Send Discord alert for stale validator set"""
+        if self.disable_discord or not self.discord_webhook_url:
+            return
+        
+        try:
+            valset_info = staleness_result['valset_info']
+            age_hours = staleness_result['age_hours']
+            threshold_hours = staleness_result['threshold_hours']
+            
+            validator_timestamp = valset_info['validator_timestamp']
+            formatted_timestamp = valset_info['formatted_timestamp']
+            
+            # create alert message
+            alert_message = (
+                f"⏰ **Validator Set Stale Alert** - {self.layer_chain} → {self.evm_chain}\n\n"
+                f"**Validator Set Age:** {age_hours:.1f} hours (threshold: {threshold_hours}h)\n"
+                f"**Validator Timestamp:** {validator_timestamp}\n"
+                f"**Human Readable:** {formatted_timestamp}\n"
+                f"**Bridge Contract:** `{self.bridge_contract_address}`\n"
+                f"**Checkpoint:** `{valset_info['validator_set_checkpoint']}`\n"
+                f"**Power Threshold:** {valset_info['power_threshold']}"
+            )
+            
             payload = {
-                "username": "Bridge Monitor",
-                "embeds": [embed]
+                "content": alert_message,
+                "username": "Valset Stale Alerter"
             }
             
             response = requests.post(self.discord_webhook_url, json=payload, timeout=10)
             response.raise_for_status()
             
-            logger.info(f"✅ Sent Discord alert for stale validator set (age: {age_str})")
-            return True
+            logger.info("Sent Discord alert for stale validator set")
             
         except Exception as e:
-            logger.error(f"Failed to send Discord alert for stale validator set: {e}")
-            return False
+            logger.error(f"Failed to send Discord alert: {e}")
     
-    def check_once(self) -> bool:
-        """Check validator set staleness once
-        
-        Returns:
-            bool: True if validator set is stale, False if fresh or error
-        """
+    def generate_ping_content(self) -> str:
+        """Generate ping content with current validator set information"""
+        try:
+            valset_info = self.get_validator_set_info()
+            if not valset_info:
+                return "**Status:** Unable to get validator set information"
+            
+            validator_timestamp = valset_info['validator_timestamp']
+            formatted_timestamp = valset_info['formatted_timestamp']
+            
+            ping_content = (
+                f"**Current DataBridge Contract Validator Set:**\n"
+                f"**Bridge Contract:** `{self.bridge_contract_address}`\n"
+                f"**Validator Timestamp:** {validator_timestamp}\n"
+                f"**Human Readable:** {formatted_timestamp}\n"
+                f"**Checkpoint:** `{valset_info['validator_set_checkpoint']}`\n"
+                f"**Power Threshold:** {valset_info['power_threshold']}\n"
+                f"**Staleness Threshold:** {self.staleness_threshold_hours} hours"
+            )
+            
+            return ping_content
+            
+        except Exception as e:
+            logger.error(f"Failed to generate ping content: {e}")
+            return f"**Status:** Error generating ping content: {e}"
+    
+    def run_once(self, send_ping: bool = False) -> Optional[Dict[str, Any]]:
+        """Run validator set staleness check once"""
         logger.info("Checking validator set staleness...")
         
-        # get current validator timestamp
-        validator_timestamp = self.get_validator_timestamp()
-        if validator_timestamp is None:
-            logger.error("Could not get validator timestamp from bridge contract")
-            return False
+        # check for staleness
+        staleness_result = self.check_valset_staleness()
         
-        # check if stale
-        is_stale, age = self.is_validator_set_stale(validator_timestamp)
+        if staleness_result and staleness_result['is_stale']:
+            logger.warning("Stale validator set detected")
+            self.send_discord_alert(staleness_result)
+        elif staleness_result:
+            logger.debug("Validator set is not stale")
         
-        if is_stale:
-            logger.warning(f"🚨 Validator set is STALE: {age}")
-            # send alert
-            alert_sent = self.send_stale_alert(validator_timestamp, age)
-            if alert_sent:
-                logger.info("Discord alert sent for stale validator set")
-            return True
-        else:
-            logger.info(f"✅ Validator set is fresh (age: {age})")
-            return False
+        # check for scheduled ping
+        if self.ping_helper.should_send_ping(self.ping_frequency_days) or send_ping:
+            ping_content = self.generate_ping_content()
+            self.ping_helper.send_ping(ping_content, self.ping_frequency_days, force=send_ping)
+        
+        return staleness_result
     
-    def run_once(self) -> int:
-        """Run once and check validator set staleness
+    def run_continuous(self, interval_minutes: int = 60):
+        """Run continuous monitoring with specified interval"""
+        interval_seconds = interval_minutes * 60
         
-        Returns:
-            int: 1 if stale, 0 if fresh, -1 if error
-        """
-        logger.info("Starting valset stale alerter (run once)")
+        logger.info(f"Starting continuous validator set staleness monitoring (interval: {interval_minutes}m)")
         
         try:
-            is_stale = self.check_once()
-            return 1 if is_stale else 0
+            while True:
+                try:
+                    self.run_once()
+                except Exception as e:
+                    logger.error(f"Error during monitoring cycle: {e}")
+                
+                logger.debug(f"Sleeping for {interval_minutes} minutes...")
+                time.sleep(interval_seconds)
+                
+        except KeyboardInterrupt:
+            logger.info("Monitoring stopped by user")
         except Exception as e:
-            logger.error(f"Error checking validator set staleness: {e}")
-            return -1
-    
-    def run_continuous(self, interval_seconds: int = 300):  # 5 minutes default
-        """Run continuously and check validator set staleness at intervals"""
-        logger.info(f"Starting valset stale alerter (continuous mode, interval: {interval_seconds}s)")
-        
-        last_alert_time = None
-        alert_cooldown_hours = 6  # only alert every 6 hours for the same stale condition
-        
-        while True:
-            try:
-                # get current validator timestamp
-                validator_timestamp = self.get_validator_timestamp()
-                if validator_timestamp is None:
-                    logger.error("Could not get validator timestamp from bridge contract")
-                    time.sleep(interval_seconds)
-                    continue
-                
-                # check if stale
-                is_stale, age = self.is_validator_set_stale(validator_timestamp)
-                
-                if is_stale:
-                    # check cooldown to avoid spam
-                    now = datetime.utcnow()
-                    should_alert = (last_alert_time is None or 
-                                  (now - last_alert_time).total_seconds() > alert_cooldown_hours * 3600)
-                    
-                    if should_alert:
-                        logger.warning(f"🚨 Validator set is STALE: {age}")
-                        alert_sent = self.send_stale_alert(validator_timestamp, age)
-                        if alert_sent:
-                            last_alert_time = now
-                            logger.info(f"Discord alert sent (next alert in {alert_cooldown_hours}h)")
-                    else:
-                        time_until_next = alert_cooldown_hours * 3600 - (now - last_alert_time).total_seconds()
-                        logger.info(f"Validator set still stale (age: {age}), next alert in {time_until_next/3600:.1f}h")
-                else:
-                    logger.debug(f"✅ Validator set is fresh (age: {age})")
-                    # reset alert time if validator set becomes fresh
-                    if last_alert_time is not None:
-                        logger.info("Validator set is fresh again, resetting alert cooldown")
-                        last_alert_time = None
-                
-            except Exception as e:
-                logger.error(f"Error in continuous monitoring: {e}")
-            
-            time.sleep(interval_seconds)
-
+            logger.error(f"Monitoring stopped due to error: {e}")
+            raise
 
 def main():
-    """Main entry point for valset stale alerter"""
-    import argparse
-    
-    parser = argparse.ArgumentParser(
-        description="Valset Stale Alerter - Send Discord alerts when bridge validator set is too old"
-    )
-    
+    """Main entry point for the validator set stale alerter"""
+    parser = argparse.ArgumentParser(description='Monitor TellorDataBridge validator set for staleness')
     parser.add_argument('--once', action='store_true', help='Run once instead of continuously')
-    parser.add_argument('--interval', type=int, default=300, 
-                       help='Check interval in seconds for continuous mode (default: 300)')
-    parser.add_argument('--stale-threshold', type=int, default=336,
-                       help='Hours after which validator set is considered stale (default: 336 = 2 weeks)')
-    parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
-    parser.add_argument('--no-color', action='store_true', help='Disable colored output')
     parser.add_argument('--no-discord', action='store_true', help='Disable Discord alerts')
+    parser.add_argument('--bridge-address', type=str, help='Override TellorDataBridge contract address')
+    parser.add_argument('--interval', type=int, default=60, help='Monitoring interval in minutes (default: 60)')
+    parser.add_argument('--ping-frequency', type=int, default=7, help='Ping frequency in days (default: 7)')
+    parser.add_argument('--ping-now', action='store_true', help='Send ping immediately')
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose debug logging')
     parser.add_argument('--config', type=str, help='Specify which configuration profile to use (overrides ACTIVE_CONFIG)')
     
     args = parser.parse_args()
@@ -363,39 +310,37 @@ def main():
     if args.config:
         from config import set_global_config_override
         set_global_config_override(args.config)
-        print(f"Using configuration: {args.config}")
     
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+    # setup logging based on verbose flag
+    setup_logging(verbose=args.verbose)
     
-    # log warning if Discord is disabled
-    if args.no_discord:
-        logger.warning("⚠️  Discord alerts are DISABLED via --no-discord flag")
+    # log which config we're using if override was provided
+    if args.config:
+        logger.info(f"🔧 Using configuration: {args.config}")
     
     try:
+        # initialize alerter
         alerter = ValsetStaleAlerter(
             disable_discord=args.no_discord,
-            stale_threshold_hours=args.stale_threshold
+            bridge_contract_address=args.bridge_address,
+            ping_frequency_days=args.ping_frequency
         )
         
         if args.once:
-            result = alerter.run_once()
-            if result == 1:
-                print("Validator set is STALE")
-                exit(1)
-            elif result == 0:
-                print("Validator set is fresh")
-                exit(0)
-            else:
-                print("Error checking validator set")
-                exit(2)
+            # run once
+            result = alerter.run_once(send_ping=args.ping_now)
+            if result:
+                print(f"\nValidator Set Status:")
+                print(f"  Timestamp: {result['valset_info']['validator_timestamp']}")
+                print(f"  Age: {result['age_hours']:.1f} hours")
+                print(f"  Stale: {result['is_stale']}")
         else:
-            alerter.run_continuous(args.interval)
+            # run continuously
+            alerter.run_continuous(interval_minutes=args.interval)
             
     except Exception as e:
-        logger.error(f"Valset stale alerter failed: {e}")
+        logger.error(f"Alerter failed: {e}")
         exit(1)
-
 
 if __name__ == "__main__":
     main()

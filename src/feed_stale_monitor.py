@@ -26,17 +26,21 @@ import pytz
 from pathlib import Path
 from config_manager import get_config_manager
 from logger_utils import setup_logging
+from ping_helper import PingHelper
+from rpc_failover import EVMProviderPool
 
 # logging will be configured in main() based on --verbose flag
 logger = logging.getLogger(__name__)
 
 class FeedStaleMonitor:
-    def __init__(self, disable_discord: bool = False, databank_contract_address: Optional[str] = None):
+    def __init__(self, disable_discord: bool = False, databank_contract_address: Optional[str] = None,
+                 ping_frequency_days: int = 7):
         """Initialize the feed stale monitor
         
         Args:
             disable_discord: If True, skip sending Discord alerts
             databank_contract_address: Override TellorDataBank contract address
+            ping_frequency_days: Ping frequency in days (7=weekly, 1=daily, etc.)
         """
         try:
             self.config_manager = get_config_manager()
@@ -53,19 +57,23 @@ class FeedStaleMonitor:
             
             # store settings
             self.disable_discord = disable_discord
+            self.ping_frequency_days = ping_frequency_days
             
-            # initialize Web3
-            self.w3 = Web3(Web3.HTTPProvider(self.evm_rpc_url))
-            
-            # test connection by trying to get latest block
+            # multi-RPC provider pool for EVM
+            self.evm_rpc_urls = self.config_manager.get_evm_rpc_urls()
+            reset_minutes = self.config_manager.get_rpc_preference_reset_minutes()
+            self.evm_pool = EVMProviderPool(self.evm_rpc_urls, request_timeout_s=15, preference_reset_minutes=reset_minutes)
+
+            # test connection by trying to get latest block via pool
             try:
-                latest_block = self.w3.eth.block_number
+                w3 = self.evm_pool.ensure_connected()
+                latest_block = w3.eth.block_number
                 logger.debug(f"Connected to EVM RPC. Latest block: {latest_block}")
             except Exception as e:
-                raise ConnectionError(f"Failed to connect to EVM RPC: {e}")
+                raise ConnectionError(f"Failed to connect to any EVM RPC: {e}")
             
-            # load databank contract ABI and create contract instance
-            self.databank_contract = self._load_databank_contract()
+            # load databank ABI
+            self.databank_abi = self._load_databank_abi()
             
             # load query IDs configuration
             self.feeds_config = self._load_feeds_config()
@@ -84,6 +92,13 @@ class FeedStaleMonitor:
             validation_dir.mkdir(parents=True, exist_ok=True)
             self.alert_state_file = validation_dir / "last_feed_staleness_alert.json"
             self.last_alerted_timestamps = self._load_alert_state()
+            
+            # initialize ping helper
+            self.ping_helper = PingHelper(
+                script_name="feed_stale_monitor",
+                data_dir=data_dir,
+                discord_webhook_url=self.discord_webhook_url
+            )
             
             logger.info(f"Initialized FeedStaleMonitor for {self.layer_chain} → {self.evm_chain}")
             logger.info(f"DataBank contract: {self.databank_contract_address}")
@@ -107,25 +122,16 @@ class FeedStaleMonitor:
             raise ValueError("TellorDataBank contract address not configured. Please set 'databank_contract' in config.json or use --databank-address")
         return databank_address
     
-    def _load_databank_contract(self):
-        """Load the TellorDataBank contract ABI and create Web3 contract instance"""
+    def _load_databank_abi(self):
+        """Load the TellorDataBank contract ABI"""
         try:
-            # load ABI from file
             abi_path = "abis/TellorDataBank.json"
             with open(abi_path, 'r') as f:
                 contract_data = json.load(f)
-            
-            # create contract instance
-            contract = self.w3.eth.contract(
-                address=self.databank_contract_address,
-                abi=contract_data['abi']
-            )
-            
-            logger.debug(f"Loaded TellorDataBank contract from {abi_path}")
-            return contract
-            
+            logger.debug(f"Loaded TellorDataBank ABI from {abi_path}")
+            return contract_data['abi']
         except Exception as e:
-            logger.error(f"Failed to load TellorDataBank contract: {e}")
+            logger.error(f"Failed to load TellorDataBank ABI: {e}")
             raise
     
     def _load_feeds_config(self) -> Dict[str, Any]:
@@ -163,9 +169,9 @@ class FeedStaleMonitor:
         """Get Discord webhook URL for feed stale alerts"""
         try:
             # try to get from discord_webhooks configuration first
-            webhooks = self.config_manager.get_discord_webhooks()
-            if webhooks and 'feed_stale' in webhooks:
-                return webhooks['feed_stale']
+            webhook_url = self.config_manager.get_discord_webhook('feed_stale')
+            if webhook_url and webhook_url != "N/A":
+                return webhook_url
             
             # fallback to general discord webhook
             return self.config_manager.get_discord_webhook_url()
@@ -233,6 +239,14 @@ class FeedStaleMonitor:
         age_ms = now_ms - timestamp_ms
         return age_ms / (1000 * 60 * 60)  # convert to hours
     
+    def _call_get_current_aggregate(self, query_id: str):
+        """Call getCurrentAggregateData via EVM provider pool with failover"""
+        return self.evm_pool.with_contract_call(
+            address=self.databank_contract_address,
+            abi=self.databank_abi,
+            fn_builder=lambda c: c.functions.getCurrentAggregateData(query_id).call()
+        )
+    
     def check_feed_staleness(self, feed: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Check if a single feed is stale
         
@@ -248,7 +262,7 @@ class FeedStaleMonitor:
             
             # call getCurrentAggregateData
             try:
-                aggregate_data = self.databank_contract.functions.getCurrentAggregateData(query_id).call()
+                aggregate_data = self._call_get_current_aggregate(query_id)
             except Exception as e:
                 logger.error(f"Failed to get aggregate data for {feed_name}: {e}")
                 return None
@@ -290,6 +304,96 @@ class FeedStaleMonitor:
             logger.error(f"Error checking feed staleness for {feed.get('name', 'unknown')}: {e}")
             return None
     
+    def get_feed_status_for_ping(self, feed: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Get feed status for ping (returns info regardless of staleness)
+        
+        Args:
+            feed: Feed configuration with queryId and name
+            
+        Returns:
+            Dictionary with feed info or None if no data/error
+        """
+        try:
+            query_id = feed['queryId']
+            feed_name = feed['name']
+            
+            # call getCurrentAggregateData
+            try:
+                aggregate_data = self._call_get_current_aggregate(query_id)
+            except Exception as e:
+                logger.error(f"Failed to get aggregate data for {feed_name}: {e}")
+                return None
+            
+            # extract timestamps (in milliseconds)
+            # aggregate_data tuple: (value, power, aggregateTimestamp, attestationTimestamp, relayTimestamp)
+            aggregate_timestamp = aggregate_data[2]  # aggregateTimestamp
+            relay_timestamp = aggregate_data[4]      # relayTimestamp
+            
+            # check if data exists
+            if aggregate_timestamp == 0:
+                logger.debug(f"No data found for feed {feed_name}")
+                return None
+            
+            # calculate age
+            age_hours = self._calculate_age_hours(aggregate_timestamp)
+            threshold_hours = self.feeds_config['staleness_threshold_hours']
+            
+            return {
+                'feed': feed,
+                'aggregate_timestamp': aggregate_timestamp,
+                'relay_timestamp': relay_timestamp,
+                'age_hours': age_hours,
+                'threshold_hours': threshold_hours,
+                'is_stale': age_hours > threshold_hours
+            }
+                
+        except Exception as e:
+            logger.error(f"Error getting feed status for {feed.get('name', 'unknown')}: {e}")
+            return None
+
+    def generate_ping_content(self) -> str:
+        """Generate ping content with current monitoring status"""
+        try:
+            ping_content = (
+                f"**Monitoring Feed Staleness:**\n"
+                f"**DataBank Contract:** `{self.databank_contract_address}`\n"
+                f"**Chain:** {self.evm_chain}\n"
+                f"**Feeds Monitored:** {len(self.feeds_config['feeds'])}\n"
+                f"**Staleness Threshold:** {self.feeds_config['staleness_threshold_hours']} hours\n\n"
+                f"**Current Status for Each Feed:**\n"
+            )
+            
+            for feed in self.feeds_config['feeds']:
+                query_id = feed['queryId']
+                feed_name = feed['name']
+                
+                try:
+                    # get current status for this feed (regardless of staleness)
+                    feed_status = self.get_feed_status_for_ping(feed)
+                    
+                    if feed_status:
+                        aggregate_timestamp = feed_status['aggregate_timestamp']
+                        age_hours = feed_status['age_hours']
+                        is_stale = feed_status['is_stale']
+                        
+                        # format timestamp for display
+                        formatted_time = self.ping_helper.format_timestamp_et(aggregate_timestamp)
+                        
+                        # show status with timestamp
+                        status = "STALE" if is_stale else "Fresh"
+                        ping_content += f"**{feed_name}:** {status} - {aggregate_timestamp} ({formatted_time}) - {age_hours:.1f}h old\n"
+                    else:
+                        ping_content += f"**{feed_name}:** No data available\n"
+                        
+                except Exception as e:
+                    ping_content += f"**{feed_name}:** Error checking status - {str(e)}\n"
+            
+            return ping_content
+            
+        except Exception as e:
+            logger.error(f"Failed to generate ping content: {e}")
+            return f"**Status:** Error generating ping content: {e}"
+
     def send_discord_alert(self, stale_info: Dict[str, Any]):
         """Send Discord alert for stale feed"""
         if self.disable_discord or not self.discord_webhook_url:
@@ -347,7 +451,7 @@ class FeedStaleMonitor:
         
         return stale_feeds
     
-    def run_once(self) -> List[Dict[str, Any]]:
+    def run_once(self, send_ping: bool = False) -> List[Dict[str, Any]]:
         """Run staleness check once and return results"""
         logger.info("Running feed staleness check...")
         
@@ -365,9 +469,15 @@ class FeedStaleMonitor:
         else:
             logger.info("All feeds are fresh")
         
+        # check for scheduled ping
+        if self.ping_helper.should_send_ping(self.ping_frequency_days) or send_ping:
+            ping_content = self.generate_ping_content()
+            logger.debug(f"Generated ping content: {ping_content}")
+            self.ping_helper.send_ping(ping_content, self.ping_frequency_days, force=send_ping)
+        
         return stale_feeds
     
-    def run_continuous(self):
+    def run_continuous(self, send_initial_ping: bool = False):
         """Run continuous monitoring with configured interval"""
         interval_minutes = self.feeds_config['monitoring_interval_minutes']
         interval_seconds = interval_minutes * 60
@@ -375,9 +485,13 @@ class FeedStaleMonitor:
         logger.info(f"Starting continuous feed staleness monitoring (interval: {interval_minutes}m)")
         
         try:
+            # First run - check if we should send initial ping
+            first_run = True
             while True:
                 try:
-                    self.run_once()
+                    send_ping_now = send_initial_ping and first_run
+                    self.run_once(send_ping=send_ping_now)
+                    first_run = False
                 except Exception as e:
                     logger.error(f"Error during monitoring cycle: {e}")
                 
@@ -396,28 +510,41 @@ def main():
     parser.add_argument('--once', action='store_true', help='Run once instead of continuously')
     parser.add_argument('--no-discord', action='store_true', help='Disable Discord alerts')
     parser.add_argument('--databank-address', type=str, help='Override TellorDataBank contract address')
+    parser.add_argument('--ping-frequency', type=int, default=7, help='Ping frequency in days (default: 7)')
+    parser.add_argument('--ping-now', action='store_true', help='Send ping immediately')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose debug logging')
+    parser.add_argument('--config', type=str, help='Specify which configuration profile to use (overrides ACTIVE_CONFIG)')
     
     args = parser.parse_args()
     
+    # set config override if --config flag was provided
+    if args.config:
+        from config import set_global_config_override
+        set_global_config_override(args.config)
+    
     # setup logging based on verbose flag
     setup_logging(verbose=args.verbose)
+    
+    # log which config we're using if override was provided
+    if args.config:
+        logger.info(f"🔧 Using configuration: {args.config}")
     
     try:
         # initialize monitor
         monitor = FeedStaleMonitor(
             disable_discord=args.no_discord,
-            databank_contract_address=args.databank_address
+            databank_contract_address=args.databank_address,
+            ping_frequency_days=args.ping_frequency
         )
         
         if args.once:
             # run once
-            stale_feeds = monitor.run_once()
+            stale_feeds = monitor.run_once(send_ping=args.ping_now)
             if stale_feeds:
                 exit(1)  # exit with error code if stale feeds found
         else:
             # run continuously
-            monitor.run_continuous()
+            monitor.run_continuous(send_initial_ping=args.ping_now)
             
     except Exception as e:
         logger.error(f"Monitor failed: {e}")

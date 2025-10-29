@@ -26,6 +26,8 @@ import hashlib
 from eth_keys import keys
 from eth_utils import decode_hex
 from config_manager import get_config_manager
+import pytz
+from ping_helper import PingHelper
 
 # configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -79,16 +81,34 @@ class AttestVerifier:
         # initialize database schema if needed
         self.db.init_database()
         
-        # discord webhook URL (from environment variable, unless disabled)
+        # discord webhook URL (from config manager, unless disabled)
         if self.disable_discord:
             self.discord_webhook_url = None
             logger.warning("Discord alerts: DISABLED via --no-discord flag")
         else:
-            self.discord_webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
+            try:
+                # prefer specific malicious activity webhook; fallback to general webhook
+                self.discord_webhook_url = self.config_manager.get_discord_webhook('malicious_activity') or \
+                                           self.config_manager.get_discord_webhook_url()
+            except Exception as e:
+                self.discord_webhook_url = None
+                logger.warning(f"Could not get Discord webhook URL: {e}")
+            
             if self.discord_webhook_url:
                 logger.info("Discord alerts enabled")
             else:
-                logger.info("Discord alerts disabled (DISCORD_WEBHOOK_URL not set)")
+                logger.info("Discord alerts disabled (no webhook configured)")
+
+        # initialize ping helper (weekly by default)
+        try:
+            self.ping_frequency_days = 7
+            self.ping_helper = PingHelper(
+                script_name="attest_verifier",
+                data_dir=self.config_manager.get_data_dir(),
+                discord_webhook_url=self.discord_webhook_url
+            )
+        except Exception as e:
+            logger.warning(f"Failed to initialize PingHelper: {e}")
     
     def test_connection(self):
         """Test connection to Layer RPC"""
@@ -428,6 +448,37 @@ class AttestVerifier:
             
         except Exception as e:
             logger.error(f"Failed to send Discord alert: {e}")
+
+    def generate_ping_content(self) -> str:
+        """Generate ping content summarizing attestation validation status"""
+        try:
+            state = self.load_validation_state()
+            total = state.get('total_validations', 0)
+            last_tx = state.get('last_tx_hash', 'none')
+            last_block = state.get('last_block_number', 0)
+            last_time_raw = state.get('last_validation_timestamp', 'Never')
+            # Convert last validation time to US Eastern timezone for display
+            last_time = "Never"
+            if isinstance(last_time_raw, str) and last_time_raw != "Never":
+                try:
+                    iso_string = last_time_raw.replace('Z', '+00:00')
+                    parsed_dt = datetime.fromisoformat(iso_string)
+                    if parsed_dt.tzinfo is None:
+                        parsed_dt = pytz.UTC.localize(parsed_dt)
+                    eastern_tz = pytz.timezone('US/Eastern')
+                    last_time = parsed_dt.astimezone(eastern_tz).strftime('%Y-%m-%d %H:%M:%S %Z')
+                except Exception:
+                    last_time = last_time_raw
+            return (
+                f"**Attestation Verifier**\n"
+                f"**Total Validations:** {total}\n"
+                f"**Last Validated Tx:** `{last_tx}`\n"
+                f"**Last Block:** `{last_block}`\n"
+                f"**Last Validation Time:** {last_time}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to generate ping content: {e}")
+            return f"**Status:** Error generating ping content: {e}"
     
     def decode_verify_oracle_data_calldata(self, input_data: str) -> Optional[Dict[str, Any]]:
         """
@@ -803,6 +854,13 @@ class AttestVerifier:
         checkpoints = self.load_checkpoint_data()
         all_attestations = self.load_attestation_data()
         
+        # scheduled weekly ping before early return paths
+        try:
+            if getattr(self, 'ping_helper', None) and self.ping_helper.should_send_ping(self.ping_frequency_days):
+                self.ping_helper.send_ping(self.generate_ping_content(), self.ping_frequency_days)
+        except Exception as e:
+            logger.warning(f"Ping check/send failed: {e}")
+        
         if not checkpoints:
             logger.error("No checkpoint data available")
             return
@@ -871,3 +929,11 @@ class AttestVerifier:
             logger.warning(f"🚨 {malicious_count} malicious attestations detected from valid validators!")
         if invalid_signature_count > 0:
             logger.info(f"🔒 {invalid_signature_count} attestations filtered out (invalid validator signatures)")
+
+        # scheduled weekly ping
+        try:
+            if getattr(self, 'ping_helper', None) and self.ping_helper.should_send_ping(self.ping_frequency_days):
+                ping_content = self.generate_ping_content()
+                self.ping_helper.send_ping(ping_content, self.ping_frequency_days)
+        except Exception as e:
+            logger.warning(f"Ping check/send failed: {e}")
