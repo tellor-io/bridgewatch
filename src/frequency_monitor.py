@@ -26,6 +26,7 @@ import pytz
 from pathlib import Path
 from config_manager import get_config_manager
 from logger_utils import setup_logging
+from rpc_failover import EVMProviderPool
 
 # logging will be configured in main() based on --verbose flag
 logger = logging.getLogger(__name__)
@@ -43,25 +44,27 @@ class FrequencyMonitor:
             
             # get configuration
             self.databank_contract_address = databank_contract_address or self.config_manager.get_databank_contract()
-            self.evm_rpc_url = self.config_manager.get_evm_rpc_url()
+            self.evm_rpc_urls = self.config_manager.get_evm_rpc_urls()
             self.layer_chain = self.config_manager.get_layer_chain()
             self.evm_chain = self.config_manager.get_evm_chain()
             
             # store settings
             self.disable_discord = disable_discord
             
-            # initialize Web3
-            self.w3 = Web3(Web3.HTTPProvider(self.evm_rpc_url))
-            
-            # test connection
+            # initialize EVM provider pool
+            reset_minutes = self.config_manager.get_rpc_preference_reset_minutes()
+            self.evm_pool = EVMProviderPool(self.evm_rpc_urls, request_timeout_s=15, preference_reset_minutes=reset_minutes)
+
+            # test EVM connection
             try:
-                latest_block = self.w3.eth.block_number
+                w3 = self.evm_pool.ensure_connected()
+                latest_block = w3.eth.block_number
                 logger.debug(f"Connected to EVM RPC. Latest block: {latest_block}")
             except Exception as e:
-                raise ConnectionError(f"Failed to connect to EVM RPC: {e}")
+                raise ConnectionError(f"Failed to connect to any EVM RPC: {e}")
             
-            # load databank contract
-            self.databank_contract = self._load_databank_contract()
+            # load databank ABI
+            self.databank_abi = self._load_databank_abi()
             
             # load query IDs configuration
             self.query_feeds = self._load_query_ids()
@@ -86,24 +89,33 @@ class FrequencyMonitor:
             logger.error(f"Failed to initialize FrequencyMonitor: {e}")
             raise
     
-    def _load_databank_contract(self):
-        """Load the TellorDataBank contract ABI and create Web3 contract instance"""
+    def _load_databank_abi(self):
+        """Load the TellorDataBank contract ABI"""
         try:
             abi_path = "abis/TellorDataBank.json"
             with open(abi_path, 'r') as f:
                 contract_data = json.load(f)
-            
-            contract = self.w3.eth.contract(
-                address=self.databank_contract_address,
-                abi=contract_data['abi']
-            )
-            
-            logger.debug(f"Loaded TellorDataBank contract from {abi_path}")
-            return contract
-            
+            logger.debug(f"Loaded TellorDataBank ABI from {abi_path}")
+            return contract_data['abi']
         except Exception as e:
-            logger.error(f"Failed to load TellorDataBank contract: {e}")
+            logger.error(f"Failed to load TellorDataBank ABI: {e}")
             raise
+    
+    def _call_get_aggregate_value_count(self, query_id: str):
+        """Call getAggregateValueCount via EVM provider pool with failover"""
+        return self.evm_pool.with_contract_call(
+            address=self.databank_contract_address,
+            abi=self.databank_abi,
+            fn_builder=lambda c: c.functions.getAggregateValueCount(query_id).call()
+        )
+    
+    def _call_get_aggregate_by_index(self, query_id: str, index: int):
+        """Call getAggregateByIndex via EVM provider pool with failover"""
+        return self.evm_pool.with_contract_call(
+            address=self.databank_contract_address,
+            abi=self.databank_abi,
+            fn_builder=lambda c: c.functions.getAggregateByIndex(query_id, index).call()
+        )
     
     def _load_query_ids(self) -> List[Dict[str, str]]:
         """Load query IDs from query_ids.json"""
@@ -188,7 +200,7 @@ class FrequencyMonitor:
         """
         try:
             # get total number of reports for this queryId
-            total_count = self.databank_contract.functions.getAggregateValueCount(query_id).call()
+            total_count = self._call_get_aggregate_value_count(query_id)
             
             if total_count == 0:
                 logger.debug(f"No reports found for {query_id}")
@@ -199,7 +211,7 @@ class FrequencyMonitor:
             # iterate through all reports and count those in our time period
             for index in range(total_count):
                 try:
-                    aggregate_data = self.databank_contract.functions.getAggregateByIndex(query_id, index).call()
+                    aggregate_data = self._call_get_aggregate_by_index(query_id, index)
                     aggregate_timestamp = aggregate_data[2]  # aggregateTimestamp
                     
                     if aggregate_timestamp == 0:

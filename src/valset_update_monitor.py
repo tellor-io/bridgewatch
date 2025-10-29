@@ -27,6 +27,7 @@ from pathlib import Path
 from config_manager import get_config_manager
 from logger_utils import setup_logging
 from ping_helper import PingHelper
+from rpc_failover import EVMProviderPool
 
 # logging will be configured in main() based on --verbose flag
 logger = logging.getLogger(__name__)
@@ -46,7 +47,7 @@ class ValsetUpdateMonitor:
             
             # get configuration
             self.bridge_contract_address = bridge_contract_address or self.config_manager.get_bridge_contract()
-            self.evm_rpc_url = self.config_manager.get_evm_rpc_url()
+            self.evm_rpc_urls = self.config_manager.get_evm_rpc_urls()
             self.layer_chain = self.config_manager.get_layer_chain()
             self.evm_chain = self.config_manager.get_evm_chain()
             
@@ -54,18 +55,20 @@ class ValsetUpdateMonitor:
             self.disable_discord = disable_discord
             self.ping_frequency_days = ping_frequency_days
             
-            # initialize Web3
-            self.w3 = Web3(Web3.HTTPProvider(self.evm_rpc_url))
-            
-            # test connection
+            # initialize EVM provider pool
+            reset_minutes = self.config_manager.get_rpc_preference_reset_minutes()
+            self.evm_pool = EVMProviderPool(self.evm_rpc_urls, request_timeout_s=15, preference_reset_minutes=reset_minutes)
+
+            # test EVM connection
             try:
-                latest_block = self.w3.eth.block_number
+                w3 = self.evm_pool.ensure_connected()
+                latest_block = w3.eth.block_number
                 logger.debug(f"Connected to EVM RPC. Latest block: {latest_block}")
             except Exception as e:
-                raise ConnectionError(f"Failed to connect to EVM RPC: {e}")
+                raise ConnectionError(f"Failed to connect to any EVM RPC: {e}")
             
-            # load bridge contract
-            self.bridge_contract = self._load_bridge_contract()
+            # load bridge ABI
+            self.bridge_abi = self._load_bridge_abi()
             
             # get Discord webhook URL
             self.discord_webhook_url = None if disable_discord else self._get_valset_updates_discord_webhook()
@@ -102,24 +105,31 @@ class ValsetUpdateMonitor:
             logger.error(f"Failed to initialize ValsetUpdateMonitor: {e}")
             raise
     
-    def _load_bridge_contract(self):
-        """Load the TellorDataBridge contract ABI and create Web3 contract instance"""
+    def _load_bridge_abi(self):
+        """Load the TellorDataBridge contract ABI"""
         try:
             abi_path = "abis/TellorDataBridge.json"
             with open(abi_path, 'r') as f:
                 contract_data = json.load(f)
-            
-            contract = self.w3.eth.contract(
-                address=self.bridge_contract_address,
-                abi=contract_data['abi']
-            )
-            
-            logger.debug(f"Loaded TellorDataBridge contract from {abi_path}")
-            return contract
-            
+            logger.debug(f"Loaded TellorDataBridge ABI from {abi_path}")
+            return contract_data['abi']
         except Exception as e:
-            logger.error(f"Failed to load TellorDataBridge contract: {e}")
+            logger.error(f"Failed to load TellorDataBridge ABI: {e}")
             raise
+    
+    def _call_get_validator_state(self):
+        """Call validator state functions via EVM provider pool with failover"""
+        def _call(contract):
+            ts = contract.functions.validatorTimestamp().call()
+            cp = contract.functions.lastValidatorSetCheckpoint().call()
+            pt = contract.functions.powerThreshold().call()
+            return ts, cp, pt
+
+        return self.evm_pool.with_contract_call(
+            address=self.bridge_contract_address,
+            abi=self.bridge_abi,
+            fn_builder=lambda c: _call(c)
+        )
     
     def _get_valset_updates_discord_webhook(self) -> Optional[str]:
         """Get Discord webhook URL for validator set update alerts"""
@@ -170,10 +180,8 @@ class ValsetUpdateMonitor:
     def _get_current_validator_state(self) -> Optional[Dict[str, Any]]:
         """Get current validator state from the bridge contract"""
         try:
-            # get current validator timestamp, checkpoint, and power threshold
-            validator_timestamp = self.bridge_contract.functions.validatorTimestamp().call()
-            validator_set_checkpoint = self.bridge_contract.functions.lastValidatorSetCheckpoint().call()
-            power_threshold = self.bridge_contract.functions.powerThreshold().call()
+            # get current validator timestamp, checkpoint, and power threshold via provider pool
+            validator_timestamp, validator_set_checkpoint, power_threshold = self._call_get_validator_state()
             
             return {
                 "validator_timestamp": validator_timestamp,

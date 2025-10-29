@@ -27,6 +27,7 @@ from pathlib import Path
 from config_manager import get_config_manager
 from logger_utils import setup_logging
 from ping_helper import PingHelper
+from rpc_failover import EVMProviderPool, HttpEndpointPool
 
 # logging will be configured in main() based on --verbose flag
 logger = logging.getLogger(__name__)
@@ -46,8 +47,8 @@ class ValsetIntegrityMonitor:
             
             # get configuration
             self.bridge_contract_address = bridge_contract_address or self.config_manager.get_bridge_contract()
-            self.evm_rpc_url = self.config_manager.get_evm_rpc_url()
-            self.layer_rpc_url = self.config_manager.get_layer_rpc_url()
+            self.evm_rpc_urls = self.config_manager.get_evm_rpc_urls()
+            self.layer_rpc_urls = self.config_manager.get_layer_rpc_urls()
             self.layer_chain = self.config_manager.get_layer_chain()
             self.evm_chain = self.config_manager.get_evm_chain()
             
@@ -55,18 +56,21 @@ class ValsetIntegrityMonitor:
             self.disable_discord = disable_discord
             self.ping_frequency_days = ping_frequency_days
             
-            # initialize Web3
-            self.w3 = Web3(Web3.HTTPProvider(self.evm_rpc_url))
-            
-            # test connection
+            # initialize provider pools
+            reset_minutes = self.config_manager.get_rpc_preference_reset_minutes()
+            self.evm_pool = EVMProviderPool(self.evm_rpc_urls, request_timeout_s=15, preference_reset_minutes=reset_minutes)
+            self.layer_pool = HttpEndpointPool(self.layer_rpc_urls, timeout_s=10, preference_reset_minutes=reset_minutes)
+
+            # test EVM connection
             try:
-                latest_block = self.w3.eth.block_number
+                w3 = self.evm_pool.ensure_connected()
+                latest_block = w3.eth.block_number
                 logger.debug(f"Connected to EVM RPC. Latest block: {latest_block}")
             except Exception as e:
-                raise ConnectionError(f"Failed to connect to EVM RPC: {e}")
+                raise ConnectionError(f"Failed to connect to any EVM RPC: {e}")
             
-            # load bridge contract
-            self.bridge_contract = self._load_bridge_contract()
+            # load bridge ABI
+            self.bridge_abi = self._load_bridge_abi()
             
             # get Discord webhook URL for malicious activity
             self.discord_webhook_url = None if disable_discord else self._get_malicious_activity_discord_webhook()
@@ -92,7 +96,7 @@ class ValsetIntegrityMonitor:
             
             logger.info(f"Initialized ValsetIntegrityMonitor for {self.layer_chain} → {self.evm_chain}")
             logger.info(f"Bridge contract: {self.bridge_contract_address}")
-            logger.info(f"Layer RPC: {self.layer_rpc_url}")
+            logger.info(f"Layer RPC: {self.config_manager.get_layer_rpc_url()}")
             logger.info(f"State file: {self.state_file}")
             
             if self.disable_discord:
@@ -104,23 +108,17 @@ class ValsetIntegrityMonitor:
             logger.error(f"Failed to initialize ValsetIntegrityMonitor: {e}")
             raise
     
-    def _load_bridge_contract(self):
-        """Load the TellorDataBridge contract ABI and create Web3 contract instance"""
+    def _load_bridge_abi(self):
+        """Load the TellorDataBridge contract ABI"""
         try:
             abi_path = "abis/TellorDataBridge.json"
             with open(abi_path, 'r') as f:
                 contract_data = json.load(f)
-            
-            contract = self.w3.eth.contract(
-                address=self.bridge_contract_address,
-                abi=contract_data['abi']
-            )
-            
-            logger.debug(f"Loaded TellorDataBridge contract from {abi_path}")
-            return contract
+            logger.debug(f"Loaded TellorDataBridge ABI from {abi_path}")
+            return contract_data['abi']
             
         except Exception as e:
-            logger.error(f"Failed to load TellorDataBridge contract: {e}")
+            logger.error(f"Failed to load TellorDataBridge ABI: {e}")
             raise
     
     def _get_malicious_activity_discord_webhook(self) -> Optional[str]:
@@ -169,15 +167,23 @@ class ValsetIntegrityMonitor:
     def _get_current_validator_state(self) -> Optional[Dict[str, Any]]:
         """Get current validator state from the bridge contract"""
         try:
-            # get current validator timestamp, checkpoint, and power threshold
-            validator_timestamp = self.bridge_contract.functions.validatorTimestamp().call()
-            validator_set_checkpoint = self.bridge_contract.functions.lastValidatorSetCheckpoint().call()
-            power_threshold = self.bridge_contract.functions.powerThreshold().call()
-            
+            # get current validator timestamp, checkpoint, and power threshold via provider pool
+            def _call(contract):
+                ts = contract.functions.validatorTimestamp().call()
+                cp = contract.functions.lastValidatorSetCheckpoint().call()
+                pt = contract.functions.powerThreshold().call()
+                return ts, cp, pt
+
+            ts, cp, pt = self.evm_pool.with_contract_call(
+                address=self.bridge_contract_address,
+                abi=self.bridge_abi,
+                fn_builder=lambda c: _call(c)
+            )
+
             return {
-                "validator_timestamp": validator_timestamp,
-                "validator_set_checkpoint": validator_set_checkpoint.hex(),  # convert bytes32 to hex string
-                "power_threshold": power_threshold
+                "validator_timestamp": ts,
+                "validator_set_checkpoint": cp.hex(),  # convert bytes32 to hex string
+                "power_threshold": pt
             }
             
         except Exception as e:
@@ -194,14 +200,9 @@ class ValsetIntegrityMonitor:
             Dict with layer validator params or None if error
         """
         try:
-            url = f"{self.layer_rpc_url}/layer/bridge/get_validator_checkpoint_params/{timestamp}"
-            
-            logger.debug(f"Querying Layer API: {url}")
-            
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            
-            data = response.json()
+            path = f"/layer/bridge/get_validator_checkpoint_params/{timestamp}"
+            logger.debug(f"Querying Layer API path: {path}")
+            data = self.layer_pool.get_json(path)
             
             # check for API error response
             if 'code' in data and 'message' in data:

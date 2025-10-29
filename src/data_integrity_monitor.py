@@ -27,6 +27,7 @@ from pathlib import Path
 from config_manager import get_config_manager
 from logger_utils import setup_logging
 from ping_helper import PingHelper
+from rpc_failover import EVMProviderPool, HttpEndpointPool
 
 # logging will be configured in main() based on --verbose flag
 logger = logging.getLogger(__name__)
@@ -46,9 +47,9 @@ class DataIntegrityMonitor:
             
             # get configuration
             self.bridge_contract_address = self.config_manager.get_bridge_contract()
-            self.evm_rpc_url = self.config_manager.get_evm_rpc_url()
+            self.evm_rpc_urls = self.config_manager.get_evm_rpc_urls()
             self.layer_chain = self.config_manager.get_layer_chain()
-            self.layer_rpc_url = self.config_manager.get_layer_rpc_url()
+            self.layer_rpc_urls = self.config_manager.get_layer_rpc_urls()
             self.evm_chain = self.config_manager.get_evm_chain()
             
             # use provided databank address or derive from config
@@ -58,18 +59,21 @@ class DataIntegrityMonitor:
             self.disable_discord = disable_discord
             self.ping_frequency_days = ping_frequency_days
             
-            # initialize Web3
-            self.w3 = Web3(Web3.HTTPProvider(self.evm_rpc_url))
-            
-            # test connection
+            # initialize provider pools
+            reset_minutes = self.config_manager.get_rpc_preference_reset_minutes()
+            self.evm_pool = EVMProviderPool(self.evm_rpc_urls, request_timeout_s=15, preference_reset_minutes=reset_minutes)
+            self.layer_pool = HttpEndpointPool(self.layer_rpc_urls, timeout_s=10, preference_reset_minutes=reset_minutes)
+
+            # test EVM connection
             try:
-                latest_block = self.w3.eth.block_number
+                w3 = self.evm_pool.ensure_connected()
+                latest_block = w3.eth.block_number
                 logger.debug(f"Connected to EVM RPC. Latest block: {latest_block}")
             except Exception as e:
-                raise ConnectionError(f"Failed to connect to EVM RPC: {e}")
+                raise ConnectionError(f"Failed to connect to any EVM RPC: {e}")
             
-            # load databank contract
-            self.databank_contract = self._load_databank_contract()
+            # load databank ABI
+            self.databank_abi = self._load_databank_abi()
             
             # load query IDs configuration (same as feed stale monitor)
             self.feeds_config = self._load_feeds_config()
@@ -98,7 +102,7 @@ class DataIntegrityMonitor:
             
             logger.info(f"Initialized DataIntegrityMonitor for {self.layer_chain} → {self.evm_chain}")
             logger.info(f"DataBank contract: {self.databank_contract_address}")
-            logger.info(f"Layer RPC: {self.layer_rpc_url}")
+            logger.info(f"Layer RPC: {self.config_manager.get_layer_rpc_url()}")
             logger.info(f"Monitoring {len(self.feeds_config['feeds'])} feeds for data integrity")
             logger.info(f"Monitoring interval: {self.feeds_config['monitoring_interval_minutes']} minutes")
             
@@ -118,24 +122,33 @@ class DataIntegrityMonitor:
             raise ValueError("TellorDataBank contract address not configured. Please set 'databank_contract' in config.json or use --databank-address")
         return databank_address
     
-    def _load_databank_contract(self):
-        """Load the TellorDataBank contract ABI and create Web3 contract instance"""
+    def _load_databank_abi(self):
+        """Load the TellorDataBank contract ABI"""
         try:
             abi_path = "abis/TellorDataBank.json"
             with open(abi_path, 'r') as f:
                 contract_data = json.load(f)
-            
-            contract = self.w3.eth.contract(
-                address=self.databank_contract_address,
-                abi=contract_data['abi']
-            )
-            
-            logger.debug(f"Loaded TellorDataBank contract from {abi_path}")
-            return contract
-            
+            logger.debug(f"Loaded TellorDataBank ABI from {abi_path}")
+            return contract_data['abi']
         except Exception as e:
-            logger.error(f"Failed to load TellorDataBank contract: {e}")
+            logger.error(f"Failed to load TellorDataBank ABI: {e}")
             raise
+    
+    def _call_get_aggregate_value_count(self, query_id: str):
+        """Call getAggregateValueCount via EVM provider pool with failover"""
+        return self.evm_pool.with_contract_call(
+            address=self.databank_contract_address,
+            abi=self.databank_abi,
+            fn_builder=lambda c: c.functions.getAggregateValueCount(query_id).call()
+        )
+    
+    def _call_get_aggregate_by_index(self, query_id: str, index: int):
+        """Call getAggregateByIndex via EVM provider pool with failover"""
+        return self.evm_pool.with_contract_call(
+            address=self.databank_contract_address,
+            abi=self.databank_abi,
+            fn_builder=lambda c: c.functions.getAggregateByIndex(query_id, index).call()
+        )
     
     def _load_feeds_config(self) -> Dict[str, Any]:
         """Load feeds configuration from query_ids.json"""
@@ -196,7 +209,7 @@ class DataIntegrityMonitor:
     def _initialize_feed_state(self, query_id: str) -> int:
         """Initialize state for a new feed by checking past 48 hours of data"""
         try:
-            current_count = self.databank_contract.functions.getAggregateValueCount(query_id).call()
+            current_count = self._call_get_aggregate_value_count(query_id)
             
             if current_count == 0:
                 logger.info(f"No data found for feed {query_id}")
@@ -212,7 +225,7 @@ class DataIntegrityMonitor:
             # look backwards through indices to find first entry older than 48 hours
             for index in range(current_count - 1, -1, -1):
                 try:
-                    aggregate_data = self.databank_contract.functions.getAggregateByIndex(query_id, index).call()
+                    aggregate_data = self._call_get_aggregate_by_index(query_id, index)
                     aggregate_timestamp = aggregate_data[2]  # aggregateTimestamp
                     
                     if aggregate_timestamp == 0:
@@ -252,18 +265,17 @@ class DataIntegrityMonitor:
             else:
                 query_id_clean = query_id
             
-            url = f"{self.layer_rpc_url}/tellor-io/layer/oracle/retrieve_data/{query_id_clean}/{timestamp}"
+            path = f"/tellor-io/layer/oracle/retrieve_data/{query_id_clean}/{timestamp}"
+            logger.debug(f"Querying Layer API path: {path}")
+            data = self.layer_pool.get_json(path)
             
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
+            if data:
+                logger.debug(f"Retrieved data from Layer for {query_id} at {timestamp}")
+                return data
+            else:
+                logger.error(f"Failed to query Tellor Layer for {query_id} at {timestamp}")
+                return None
             
-            data = response.json()
-            logger.debug(f"Retrieved data from Layer for {query_id} at {timestamp}")
-            return data
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to query Tellor Layer for {query_id} at {timestamp}: {e}")
-            return None
         except Exception as e:
             logger.error(f"Error processing Layer response for {query_id} at {timestamp}: {e}")
             return None
@@ -316,7 +328,7 @@ class DataIntegrityMonitor:
         
         try:
             # get current count
-            current_count = self.databank_contract.functions.getAggregateValueCount(query_id).call()
+            current_count = self._call_get_aggregate_value_count(query_id)
             
             # initialize if this is the first time we're checking this feed
             if query_id not in self.last_checked_indices:
@@ -335,7 +347,7 @@ class DataIntegrityMonitor:
             for index in range(last_checked + 1, current_count):
                 try:
                     # get data from DataBank
-                    aggregate_data = self.databank_contract.functions.getAggregateByIndex(query_id, index).call()
+                    aggregate_data = self._call_get_aggregate_by_index(query_id, index)
                     # aggregate_data tuple: (value, power, aggregateTimestamp, attestationTimestamp, relayTimestamp)
                     databank_value = aggregate_data[0]  # bytes value
                     aggregate_timestamp = aggregate_data[2]  # uint256 timestamp in milliseconds
@@ -423,7 +435,7 @@ class DataIntegrityMonitor:
                     
                     if last_index >= 0:
                         # get the data for this index to show timestamp
-                        aggregate_data = self.databank_contract.functions.getAggregateByIndex(query_id, last_index).call()
+                        aggregate_data = self._call_get_aggregate_by_index(query_id, last_index)
                         aggregate_timestamp = aggregate_data[2]  # aggregateTimestamp
                         
                         if aggregate_timestamp > 0:

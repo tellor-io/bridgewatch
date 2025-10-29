@@ -143,22 +143,42 @@ class ConfigManager:
         errors = []
         warnings = []
         
-        # required fields
-        required_fields = [
-            'layer_chain', 'evm_chain', 'bridge_contract',
-            'layer_rpc_url', 'evm_rpc_url', 'data_dir', 'database_path'
+        # required fields (allow RPCs to be provided as single or list)
+        required_fields_base = [
+            'layer_chain', 'evm_chain', 'bridge_contract', 'data_dir', 'database_path'
         ]
         
-        for field in required_fields:
+        for field in required_fields_base:
             if field not in config:
                 errors.append(f"Missing required field: {field}")
         
-        # validate URLs
-        if 'layer_rpc_url' in config and not config['layer_rpc_url'].startswith(('http://', 'https://')):
-            errors.append("layer_rpc_url must be a valid HTTP/HTTPS URL")
-        
-        if 'evm_rpc_url' in config and not config['evm_rpc_url'].startswith(('http://', 'https://')):
-            errors.append("evm_rpc_url must be a valid HTTP/HTTPS URL")
+        # validate RPC URLs (string or list of strings)
+        def _is_http_url(s: str) -> bool:
+            return isinstance(s, str) and s.startswith(('http://', 'https://'))
+
+        # Layer RPC: either layer_rpc_urls (list) or layer_rpc_url (string) must be present
+        layer_urls = config.get('layer_rpc_urls')
+        layer_url = config.get('layer_rpc_url')
+        if layer_urls is not None:
+            if not isinstance(layer_urls, list) or not layer_urls or not all(_is_http_url(u) for u in layer_urls):
+                errors.append("layer_rpc_urls must be a non-empty list of HTTP/HTTPS URLs")
+        elif layer_url is not None:
+            if not _is_http_url(layer_url):
+                errors.append("layer_rpc_url must be a valid HTTP/HTTPS URL")
+        else:
+            errors.append("Missing required field: layer_rpc_url or layer_rpc_urls")
+
+        # EVM RPC: either evm_rpc_urls (list) or evm_rpc_url (string) must be present
+        evm_urls = config.get('evm_rpc_urls')
+        evm_url = config.get('evm_rpc_url')
+        if evm_urls is not None:
+            if not isinstance(evm_urls, list) or not evm_urls or not all(_is_http_url(u) for u in evm_urls):
+                errors.append("evm_rpc_urls must be a non-empty list of HTTP/HTTPS URLs")
+        elif evm_url is not None:
+            if not _is_http_url(evm_url):
+                errors.append("evm_rpc_url must be a valid HTTP/HTTPS URL")
+        else:
+            errors.append("Missing required field: evm_rpc_url or evm_rpc_urls")
         
         # validate bridge contract address
         if 'bridge_contract' in config:
@@ -204,12 +224,45 @@ class ConfigManager:
         return self._active_config.get('databank_contract')
     
     def get_layer_rpc_url(self) -> str:
-        """Get Layer RPC URL"""
+        """Get Layer RPC URL (primary)"""
+        urls = self._active_config.get('layer_rpc_urls')
+        if isinstance(urls, list) and urls:
+            return urls[0]
         return self._active_config['layer_rpc_url']
     
     def get_evm_rpc_url(self) -> str:
-        """Get EVM RPC URL"""
+        """Get EVM RPC URL (primary)"""
+        urls = self._active_config.get('evm_rpc_urls')
+        if isinstance(urls, list) and urls:
+            return urls[0]
         return self._active_config['evm_rpc_url']
+
+    def get_layer_rpc_urls(self) -> list:
+        """Get list of Layer RPC URLs in preference order"""
+        urls = self._active_config.get('layer_rpc_urls')
+        if isinstance(urls, list) and urls:
+            return urls
+        url = self._active_config.get('layer_rpc_url')
+        if isinstance(url, str) and url:
+            return [url]
+        raise ValueError("No Layer RPC URL(s) configured")
+
+    def get_evm_rpc_urls(self) -> list:
+        """Get list of EVM RPC URLs in preference order"""
+        urls = self._active_config.get('evm_rpc_urls')
+        if isinstance(urls, list) and urls:
+            return urls
+        url = self._active_config.get('evm_rpc_url')
+        if isinstance(url, str) and url:
+            return [url]
+        raise ValueError("No EVM RPC URL(s) configured")
+
+    def get_rpc_preference_reset_minutes(self) -> int:
+        """Get preference reset interval (minutes) for RPC selection (default 60)"""
+        try:
+            return int(self._active_config.get('rpc_preference_reset_minutes', 60))
+        except Exception:
+            return 60
     
     def get_discord_webhook_url(self) -> Optional[str]:
         """Get Discord webhook URL"""

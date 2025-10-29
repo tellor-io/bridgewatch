@@ -27,6 +27,7 @@ from pathlib import Path
 from config_manager import get_config_manager
 from logger_utils import setup_logging
 from ping_helper import PingHelper
+from rpc_failover import EVMProviderPool
 
 # logging will be configured in main() based on --verbose flag
 logger = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ class AdaptorGuardianMonitor:
             self.config_manager = get_config_manager()
             
             # get configuration
-            self.evm_rpc_url = self.config_manager.get_evm_rpc_url()
+            self.evm_rpc_urls = self.config_manager.get_evm_rpc_urls()
             self.layer_chain = self.config_manager.get_layer_chain()
             self.evm_chain = self.config_manager.get_evm_chain()
             
@@ -51,21 +52,23 @@ class AdaptorGuardianMonitor:
             self.disable_discord = disable_discord
             self.ping_frequency_days = ping_frequency_days
             
-            # initialize Web3
-            self.w3 = Web3(Web3.HTTPProvider(self.evm_rpc_url))
-            
-            # test connection
+            # initialize EVM provider pool
+            reset_minutes = self.config_manager.get_rpc_preference_reset_minutes()
+            self.evm_pool = EVMProviderPool(self.evm_rpc_urls, request_timeout_s=15, preference_reset_minutes=reset_minutes)
+
+            # test EVM connection
             try:
-                latest_block = self.w3.eth.block_number
+                w3 = self.evm_pool.ensure_connected()
+                latest_block = w3.eth.block_number
                 logger.debug(f"Connected to EVM RPC. Latest block: {latest_block}")
             except Exception as e:
-                raise ConnectionError(f"Failed to connect to EVM RPC: {e}")
+                raise ConnectionError(f"Failed to connect to any EVM RPC: {e}")
             
             # load adaptor contracts configuration
             self.adaptor_contracts = self._load_adaptor_contracts()
             
-            # load contract ABI and create contract instances
-            self.contract_instances = self._load_contract_instances()
+            # load contract ABI
+            self.contract_abi = self._load_contract_abi()
             
             # get Discord webhook URL
             self.discord_webhook_url = None if disable_discord else self._get_guardian_discord_webhook()
@@ -116,27 +119,47 @@ class AdaptorGuardianMonitor:
             logger.error(f"Failed to load adaptor contracts: {e}")
             raise
     
-    def _load_contract_instances(self) -> Dict[str, Any]:
-        """Load contract ABI and create Web3 contract instances"""
+    def _load_contract_abi(self):
+        """Load contract ABI"""
         try:
             abi_path = "abis/GuardedLiquityV2OracleAdaptor.json"
             with open(abi_path, 'r') as f:
                 contract_data = json.load(f)
-            
-            instances = {}
-            for contract_info in self.adaptor_contracts:
-                address = contract_info['address']
-                instances[address] = self.w3.eth.contract(
-                    address=address,
-                    abi=contract_data['abi']
-                )
-            
-            logger.debug(f"Loaded {len(instances)} contract instances from {abi_path}")
-            return instances
-            
+            logger.debug(f"Loaded contract ABI from {abi_path}")
+            return contract_data['abi']
         except Exception as e:
-            logger.error(f"Failed to load contract instances: {e}")
+            logger.error(f"Failed to load contract ABI: {e}")
             raise
+    
+    def _call_contract_function(self, address: str, function_name: str, *args):
+        """Call a contract function via EVM provider pool with failover"""
+        def _call(contract):
+            func = getattr(contract.functions, function_name)
+            if args:
+                return func(*args).call()
+            else:
+                return func().call()
+        
+        return self.evm_pool.with_contract_call(
+            address=address,
+            abi=self.contract_abi,
+            fn_builder=lambda c: _call(c)
+        )
+    
+    def _get_current_block_number(self) -> int:
+        """Get current block number via EVM provider pool with failover"""
+        w3 = self.evm_pool.ensure_connected()
+        return w3.eth.block_number
+    
+    def _get_logs(self, filter_params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Get event logs via EVM provider pool with failover"""
+        w3 = self.evm_pool.ensure_connected()
+        return w3.eth.get_logs(filter_params)
+    
+    def _get_block(self, block_number: int) -> Dict[str, Any]:
+        """Get block data via EVM provider pool with failover"""
+        w3 = self.evm_pool.ensure_connected()
+        return w3.eth.get_block(block_number)
     
     def _get_guardian_discord_webhook(self) -> Optional[str]:
         """Get Discord webhook URL for guardian alerts"""
@@ -164,12 +187,12 @@ class AdaptorGuardianMonitor:
                 return block_number
             else:
                 # start from current block if no state exists
-                current_block = self.w3.eth.block_number
+                current_block = self._get_current_block_number()
                 logger.info(f"No existing state file, starting from current block: {current_block}")
                 return current_block
         except Exception as e:
             logger.warning(f"Failed to load state: {e}, starting from current block")
-            return self.w3.eth.block_number
+            return self._get_current_block_number()
     
     def _save_state(self, block_number: int):
         """Save last processed block to state file"""
@@ -187,10 +210,8 @@ class AdaptorGuardianMonitor:
     def _get_contract_info(self, contract_address: str) -> Dict[str, str]:
         """Get name and project info from contract"""
         try:
-            contract = self.contract_instances[contract_address]
-            
-            name = contract.functions.name().call()
-            project = contract.functions.project().call()
+            name = self._call_contract_function(contract_address, 'name')
+            project = self._call_contract_function(contract_address, 'project')
             
             # get description from config
             description = "Unknown"
@@ -245,7 +266,7 @@ class AdaptorGuardianMonitor:
             
             # get all logs for all event types at once
             try:
-                logs = self.w3.eth.get_logs({
+                logs = self._get_logs({
                     "fromBlock": from_block,
                     "toBlock": to_block,
                     "address": contract_address,
@@ -274,7 +295,7 @@ class AdaptorGuardianMonitor:
                     
                     # get block timestamp
                     try:
-                        block = self.w3.eth.get_block(log['blockNumber'])
+                        block = self._get_block(log['blockNumber'])
                         event_data['timestamp'] = block['timestamp']
                     except Exception as e:
                         logger.warning(f"Failed to get block timestamp for block {log['blockNumber']}: {e}")
@@ -298,7 +319,7 @@ class AdaptorGuardianMonitor:
     def check_guardian_events(self) -> List[Dict[str, Any]]:
         """Check for new guardian and pause events across all contracts"""
         try:
-            current_block = self.w3.eth.block_number
+            current_block = self._get_current_block_number()
             from_block = self.last_processed_block + 1
             
             if from_block > current_block:
@@ -346,15 +367,13 @@ class AdaptorGuardianMonitor:
                 description = adaptor_config['description']
                 
                 try:
-                    contract = self.contract_instances[contract_address]
-                    
                     # get contract info
-                    contract_info = self._get_contract_info(contract)
+                    contract_info = self._get_contract_info(contract_address)
                     project = contract_info.get('project', 'Unknown Project')
                     
                     # get admin
                     try:
-                        admin_address = contract.functions.admin().call()
+                        admin_address = self._call_contract_function(contract_address, 'admin')
                         if admin_address and admin_address != "0x0000000000000000000000000000000000000000":
                             if admin_address not in admin_contracts:
                                 admin_contracts[admin_address] = {}
@@ -366,7 +385,7 @@ class AdaptorGuardianMonitor:
                     
                     # get guardians
                     try:
-                        guardian_count = contract.functions.guardianCount().call()
+                        guardian_count = self._call_contract_function(contract_address, 'guardianCount')
                         for i in range(guardian_count):
                             # unfortunately, we can't easily iterate guardians without knowing addresses
                             # we'll need to check known admin addresses as they're often guardians too

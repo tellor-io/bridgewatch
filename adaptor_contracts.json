@@ -74,7 +74,19 @@
     },
     {
       "address": "0x4458F3c67f4131D297F2f4c1D56c40F93aE3Cd2C",
-      "description": "sUSDN/USD"
+      "description": "sUSN/USD"
+    },
+    {
+      "address": "0x729Eb2BE0a940cFc2fBf58D7f4212DC98F2D4B77",
+      "description": "MUST/USD"
+    },
+    {
+      "address": "0x4b3bdd84B38DaFd455769E0cf81eBD0f1789Cf3D",
+      "description": "sMUST/USD"
+    },
+    {
+      "address": "0xE087D1936257444ec4bc34caD95cA58EE0129a7e",
+      "description": "yETH/USD"
     }
   ],
   "monitoring_interval_minutes": 5

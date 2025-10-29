@@ -89,3 +89,35 @@ Monitors GuardedLiquityV2OracleAdaptor contracts for guardian management and pau
 ## Configuration
 
 The system uses `config.json` for multi-bridge configurations. Each configuration has its own data directory and settings. Environment variables can be referenced using `${VAR_NAME}` syntax.
+
+### Multiple RPC endpoints (failover)
+
+You can provide one or many RPC endpoints for both EVM and Layer. When multiple are provided, the monitors try them in order on each request and automatically fail over if one is unavailable. The primary (first) is always preferred.
+
+Example:
+
+```json
+{
+  "configs": {
+    "my-bridge": {
+      "evm_rpc_urls": [
+        "https://primary-evm",
+        "https://backup-evm-1",
+        "https://backup-evm-2"
+      ],
+      "layer_rpc_urls": [
+        "https://primary-layer",
+        "https://backup-layer-1"
+      ],
+      "rpc_preference_reset_minutes": 60
+    }
+  }
+}
+```
+
+Notes:
+- You may still use single `evm_rpc_url` and `layer_rpc_url`; they remain fully supported.
+- When `*_rpc_urls` arrays are present, they override the single URL fields for selection, but the single URLs are treated as the primary if both are present.
+- The monitor sticks to the first working endpoint it finds and keeps using it for all calls. If that endpoint fails on a call, it retries from the beginning of the list to select the most preferred working endpoint and then sticks to that.
+- Every `rpc_preference_reset_minutes` (default 60), the preference resets so the monitor re-evaluates from the top of the list and automatically returns to the primary if it's healthy.
+- Both EVM contract calls and Layer REST API calls support failover independently.

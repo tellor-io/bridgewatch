@@ -84,8 +84,13 @@
       "queryId": "0x35155b44678db9e9e021c2cf49dd20c31b49e03415325c2beffb5221cf63882d",
       "name": "SpotPrice(yusd,usd)",
       "description": "yUSD to USD spot price"
+    },
+    {
+      "queryId": "0x9874c1c7b7e76b78afdfdda6dcecef56edf6bf3d49d6d6ef2a98404ea2e04a59",
+      "name": "SpotPrice(yeth,usd)",
+      "description": "yETH to USD spot price"
     }
   ],
-  "staleness_threshold_hours": 16,
+  "staleness_threshold_hours": 14,
   "monitoring_interval_minutes": 10
 }

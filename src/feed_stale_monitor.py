@@ -27,6 +27,7 @@ from pathlib import Path
 from config_manager import get_config_manager
 from logger_utils import setup_logging
 from ping_helper import PingHelper
+from rpc_failover import EVMProviderPool
 
 # logging will be configured in main() based on --verbose flag
 logger = logging.getLogger(__name__)
@@ -58,18 +59,21 @@ class FeedStaleMonitor:
             self.disable_discord = disable_discord
             self.ping_frequency_days = ping_frequency_days
             
-            # initialize Web3
-            self.w3 = Web3(Web3.HTTPProvider(self.evm_rpc_url))
-            
-            # test connection by trying to get latest block
+            # multi-RPC provider pool for EVM
+            self.evm_rpc_urls = self.config_manager.get_evm_rpc_urls()
+            reset_minutes = self.config_manager.get_rpc_preference_reset_minutes()
+            self.evm_pool = EVMProviderPool(self.evm_rpc_urls, request_timeout_s=15, preference_reset_minutes=reset_minutes)
+
+            # test connection by trying to get latest block via pool
             try:
-                latest_block = self.w3.eth.block_number
+                w3 = self.evm_pool.ensure_connected()
+                latest_block = w3.eth.block_number
                 logger.debug(f"Connected to EVM RPC. Latest block: {latest_block}")
             except Exception as e:
-                raise ConnectionError(f"Failed to connect to EVM RPC: {e}")
+                raise ConnectionError(f"Failed to connect to any EVM RPC: {e}")
             
-            # load databank contract ABI and create contract instance
-            self.databank_contract = self._load_databank_contract()
+            # load databank ABI
+            self.databank_abi = self._load_databank_abi()
             
             # load query IDs configuration
             self.feeds_config = self._load_feeds_config()
@@ -118,25 +122,16 @@ class FeedStaleMonitor:
             raise ValueError("TellorDataBank contract address not configured. Please set 'databank_contract' in config.json or use --databank-address")
         return databank_address
     
-    def _load_databank_contract(self):
-        """Load the TellorDataBank contract ABI and create Web3 contract instance"""
+    def _load_databank_abi(self):
+        """Load the TellorDataBank contract ABI"""
         try:
-            # load ABI from file
             abi_path = "abis/TellorDataBank.json"
             with open(abi_path, 'r') as f:
                 contract_data = json.load(f)
-            
-            # create contract instance
-            contract = self.w3.eth.contract(
-                address=self.databank_contract_address,
-                abi=contract_data['abi']
-            )
-            
-            logger.debug(f"Loaded TellorDataBank contract from {abi_path}")
-            return contract
-            
+            logger.debug(f"Loaded TellorDataBank ABI from {abi_path}")
+            return contract_data['abi']
         except Exception as e:
-            logger.error(f"Failed to load TellorDataBank contract: {e}")
+            logger.error(f"Failed to load TellorDataBank ABI: {e}")
             raise
     
     def _load_feeds_config(self) -> Dict[str, Any]:
@@ -244,6 +239,14 @@ class FeedStaleMonitor:
         age_ms = now_ms - timestamp_ms
         return age_ms / (1000 * 60 * 60)  # convert to hours
     
+    def _call_get_current_aggregate(self, query_id: str):
+        """Call getCurrentAggregateData via EVM provider pool with failover"""
+        return self.evm_pool.with_contract_call(
+            address=self.databank_contract_address,
+            abi=self.databank_abi,
+            fn_builder=lambda c: c.functions.getCurrentAggregateData(query_id).call()
+        )
+    
     def check_feed_staleness(self, feed: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Check if a single feed is stale
         
@@ -259,7 +262,7 @@ class FeedStaleMonitor:
             
             # call getCurrentAggregateData
             try:
-                aggregate_data = self.databank_contract.functions.getCurrentAggregateData(query_id).call()
+                aggregate_data = self._call_get_current_aggregate(query_id)
             except Exception as e:
                 logger.error(f"Failed to get aggregate data for {feed_name}: {e}")
                 return None
@@ -316,7 +319,7 @@ class FeedStaleMonitor:
             
             # call getCurrentAggregateData
             try:
-                aggregate_data = self.databank_contract.functions.getCurrentAggregateData(query_id).call()
+                aggregate_data = self._call_get_current_aggregate(query_id)
             except Exception as e:
                 logger.error(f"Failed to get aggregate data for {feed_name}: {e}")
                 return None
