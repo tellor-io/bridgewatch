@@ -95,6 +95,40 @@ class EVMProviderPool:
             raise ConnectionError(f"All EVM RPC endpoints failed for contract call: {last_error}")
         raise ConnectionError("All EVM RPC endpoints failed for contract call")
 
+    def with_web3(self, fn: Callable[[Web3], Any], max_attempts: Optional[int] = None):
+        """Execute arbitrary Web3 operations with provider failover."""
+        if self._should_reset_preferences():
+            self._last_reset_ts = time.time()
+            self._sticky_index = None
+
+        attempts = 0
+        last_error: Optional[Exception] = None
+
+        if self._sticky_index is not None:
+            try:
+                w3 = self._build_web3(self._sticky_index)
+                return fn(w3)
+            except Exception as e:
+                last_error = e
+                self._sticky_index = None
+
+        for i in self._iter_indices_in_preference_order():
+            if max_attempts is not None and attempts >= max_attempts:
+                break
+            attempts += 1
+            try:
+                w3 = self._build_web3(i)
+                result = fn(w3)
+                self._sticky_index = i
+                return result
+            except Exception as e:
+                last_error = e
+                continue
+
+        if last_error:
+            raise ConnectionError(f"All EVM RPC endpoints failed for request: {last_error}")
+        raise ConnectionError("All EVM RPC endpoints failed for request")
+
 
 class HttpEndpointPool:
     def __init__(self, base_urls: List[str], timeout_s: int = 10, preference_reset_minutes: int = 60):

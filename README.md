@@ -44,39 +44,45 @@ These standalone monitoring scripts can be run independently:
 
 ### Feed Staleness Monitor
 ```bash
-python src/feed_stale_monitor.py [--once] [--verbose]
+python src/feed_stale_monitor.py [--once] [--verbose] --config <config-name>
 ```
 Monitors TellorDataBank contracts for stale data feeds and sends Discord alerts.
 
 ### Data Integrity Monitor
 ```bash
-python src/data_integrity_monitor.py [--once] [--verbose]
+python src/data_integrity_monitor.py [--once] [--verbose] --config <config-name>
 ```
 Verifies data integrity between TellorDataBank contracts and Tellor Layer.
 
 ### Validator Set Update Monitor
 ```bash
-python src/valset_update_monitor.py [--once] [--verbose]
+python src/valset_update_monitor.py [--once] [--verbose] --config <config-name>
 ```
 Tracks validator set updates in TellorDataBridge contracts.
 
 ### Validator Set Integrity Monitor
 ```bash
-python src/valset_integrity_monitor.py [--once] [--verbose]
+python src/valset_integrity_monitor.py [--once] [--verbose] --config <config-name>
 ```
 Verifies validator set integrity between TellorDataBridge contracts and Tellor Layer.
 
 ### Frequency Monitor
 ```bash
-python src/frequency_monitor.py [--report-now] [--days N] [--verbose]
+python src/frequency_monitor.py [--report-now] [--days N] [--verbose] --config <config-name>
 ```
 Generates periodic reports on data feed activity. Runs weekly reports on Tuesdays at 9am ET by default.
 
 ### Adaptor Guardian Monitor
 ```bash
-python src/adaptor_guardian_monitor.py [--once] [--verbose]
+python src/adaptor_guardian_monitor.py [--once] [--verbose] --config <config-name>
 ```
 Monitors GuardedLiquityV2OracleAdaptor contracts for guardian management and pause/unpause events.
+
+### Token Bridge Withdraw Monitor
+```bash
+python src/token_bridge_monitor.py [--once] [--verbose] [--start-block N] [--config NAME]
+```
+Validates TokenBridge `Withdraw` events against Tellor Layer aggregate reports.
 
 ### Common Options
 - `--once` - Run once instead of continuously

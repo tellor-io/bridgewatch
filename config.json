@@ -1,10 +1,11 @@
 {
   "configs": {
-    "mainnet-bridge": {
+    "mainnet": {
       "display_name": "Tellor Mainnet → Ethereum Mainnet Bridge",
       "layer_chain": "tellor-1",
       "evm_chain": "eth-mainnet", 
       "bridge_contract": "0xFfa3393BE1E4b442fff6cD0df0794B0031e9CF65",
+      "token_bridge_contract": "0x5589e306b1920F009979a50B88caE32aecD471E4",
       "databank_contract": "0x0000000000000000000000000000000000000000",
       "layer_rpc_urls": [
         "http://localhost:1317/",
@@ -12,7 +13,7 @@
       ],
       "evm_rpc_urls": [
         "https://mainnet.infura.io/v3/${INFURA_API_KEY}",
-        "https://eth-mainnet.alchemyapi.io/v2/${ALCHEMY_API_KEY}"
+        "https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
       ],
       "discord_webhook_url": "${DISCORD_WEBHOOK_URL_MAINNET}",
       "discord_webhooks": {
@@ -24,11 +25,12 @@
       "data_dir": "data/mainnet_bridge",
       "database_path": "databases/mainnet_bridge.duckdb"
     },
-    "layertest-4-sepolia-bridge": {
+    "sepolia": {
       "display_name": "Layer Testnet 4 → Sepolia Bridge",
       "layer_chain": "layertest-4",
       "evm_chain": "sepolia", 
       "bridge_contract": "0xC69f43741D379cE93bdaAC9b5135EA3e697df1F8",
+      "token_bridge_contract": "0x5acb5977f35b1A91C4fE0F4386eB669E046776F2",
       "databank_contract": "0x0000000000000000000000000000000000000000",
       "layer_rpc_url": "https://node-palmito.tellorlayer.com",
       "evm_rpc_url": "${EVM_RPC_URL_SEPOLIA}",
@@ -81,7 +83,7 @@
       "data_dir": "data/layerlocal-2_sepolia_bridge",
       "database_path": "databases/layerlocal-2_sepolia_bridge.duckdb"
     },
-    "tellor-1-sagaevm-bridge": {
+    "saga": {
       "display_name": "Tellor 1 → Saga EVM Bridge",
       "layer_chain": "tellor-1",
       "evm_chain": "sagaevm",
@@ -118,7 +120,7 @@
     }
   },
   "monitoring": {
-    "block_batch_size": 2000,
+    "block_batch_size": 10,
     "max_retries": 3,
     "retry_delay": 5,
     "catchup_delay": 2,

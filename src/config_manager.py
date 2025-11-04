@@ -191,6 +191,12 @@ class ConfigManager:
             contract = config['databank_contract']
             if not contract.startswith('0x') or len(contract) != 42:
                 errors.append("databank_contract must be a valid Ethereum address (0x...)")
+
+        # validate token bridge contract address (optional)
+        if 'token_bridge_contract' in config and config['token_bridge_contract']:
+            contract = config['token_bridge_contract']
+            if not contract.startswith('0x') or len(contract) != 42:
+                errors.append("token_bridge_contract must be a valid Ethereum address (0x...)")
         
         # validate optional fields
         if 'discord_webhook_url' in config:
@@ -219,6 +225,13 @@ class ConfigManager:
         """Get bridge contract address"""
         return self._active_config['bridge_contract']
     
+    def get_token_bridge_contract(self) -> Optional[str]:
+        """Get token bridge contract address if configured"""
+        token_bridge = self._active_config.get('token_bridge_contract')
+        if token_bridge:
+            return token_bridge
+        return None
+
     def get_databank_contract(self) -> Optional[str]:
         """Get TellorDataBank contract address"""
         return self._active_config.get('databank_contract')
