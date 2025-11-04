@@ -26,6 +26,7 @@ from pathlib import Path
 from config_manager import get_config_manager
 from logger_utils import setup_logging
 from ping_helper import PingHelper
+from rpc_failover import EVMProviderPool
 
 # logging will be configured in main() based on --verbose flag
 logger = logging.getLogger(__name__)
@@ -44,8 +45,10 @@ class ValsetStaleAlerter:
             self.config_manager = get_config_manager()
             
             # get configuration
-            self.bridge_contract_address = bridge_contract_address or self.config_manager.get_bridge_contract()
-            self.evm_rpc_url = self.config_manager.get_evm_rpc_url()
+            self.bridge_contract_address = Web3.to_checksum_address(
+                bridge_contract_address or self.config_manager.get_bridge_contract()
+            )
+            self.evm_rpc_urls = self.config_manager.get_evm_rpc_urls()
             self.layer_chain = self.config_manager.get_layer_chain()
             self.evm_chain = self.config_manager.get_evm_chain()
             
@@ -56,18 +59,21 @@ class ValsetStaleAlerter:
             # staleness threshold (2 weeks by default)
             self.staleness_threshold_hours = stale_threshold_hours
             
-            # initialize Web3
-            self.w3 = Web3(Web3.HTTPProvider(self.evm_rpc_url))
-            
+            # initialize provider pool for RPC failover
+            reset_minutes = self.config_manager.get_rpc_preference_reset_minutes()
+            self.evm_pool = EVMProviderPool(
+                self.evm_rpc_urls, request_timeout_s=15, preference_reset_minutes=reset_minutes
+            )
+
             # test connection
             try:
-                latest_block = self.w3.eth.block_number
+                latest_block = self.evm_pool.with_web3(lambda web3: web3.eth.block_number)
                 logger.debug(f"Connected to EVM RPC. Latest block: {latest_block}")
             except Exception as e:
-                raise ConnectionError(f"Failed to connect to EVM RPC: {e}")
-            
-            # load bridge contract
-            self.bridge_contract = self._load_bridge_contract()
+                raise ConnectionError(f"Failed to connect to any EVM RPC: {e}")
+
+            # load bridge contract ABI
+            self.bridge_abi = self._load_bridge_abi()
             
             # get Discord webhook URL
             self.discord_webhook_url = None if disable_discord else self._get_valset_discord_webhook()
@@ -96,21 +102,15 @@ class ValsetStaleAlerter:
             logger.error(f"Failed to initialize ValsetStaleAlerter: {e}")
             raise
     
-    def _load_bridge_contract(self):
-        """Load the TellorDataBridge contract ABI and create Web3 contract instance"""
+    def _load_bridge_abi(self) -> Any:
+        """Load the TellorDataBridge contract ABI"""
         try:
             abi_path = "abis/TellorDataBridge.json"
             with open(abi_path, 'r') as f:
                 contract_data = json.load(f)
-            
-            contract = self.w3.eth.contract(
-                address=self.bridge_contract_address,
-                abi=contract_data['abi']
-            )
-            
             logger.debug(f"Loaded TellorDataBridge contract from {abi_path}")
-            return contract
-            
+            return contract_data['abi']
+
         except Exception as e:
             logger.error(f"Failed to load TellorDataBridge contract: {e}")
             raise
@@ -137,9 +137,19 @@ class ValsetStaleAlerter:
     def get_validator_set_info(self) -> Optional[Dict[str, Any]]:
         """Get current validator set information from bridge contract"""
         try:
-            validator_timestamp = self.bridge_contract.functions.validatorTimestamp().call()
-            validator_set_checkpoint = self.bridge_contract.functions.lastValidatorSetCheckpoint().call()
-            power_threshold = self.bridge_contract.functions.powerThreshold().call()
+            def _fetch(contract):
+                ts = contract.functions.validatorTimestamp().call()
+                cp = contract.functions.lastValidatorSetCheckpoint().call()
+                pt = contract.functions.powerThreshold().call()
+                return ts, cp, pt
+
+            validator_timestamp, validator_set_checkpoint, power_threshold = (
+                self.evm_pool.with_contract_call(
+                    address=self.bridge_contract_address,
+                    abi=self.bridge_abi,
+                    fn_builder=lambda contract: _fetch(contract),
+                )
+            )
             
             return {
                 'validator_timestamp': validator_timestamp,
