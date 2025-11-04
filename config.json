@@ -5,6 +5,7 @@
       "layer_chain": "tellor-1",
       "evm_chain": "eth-mainnet", 
       "bridge_contract": "0xFfa3393BE1E4b442fff6cD0df0794B0031e9CF65",
+      "token_bridge_contract": "0x5589e306b1920F009979a50B88caE32aecD471E4",
       "databank_contract": "0x0000000000000000000000000000000000000000",
       "layer_rpc_urls": [
         "http://localhost:1317/",
@@ -29,6 +30,7 @@
       "layer_chain": "layertest-4",
       "evm_chain": "sepolia", 
       "bridge_contract": "0xC69f43741D379cE93bdaAC9b5135EA3e697df1F8",
+      "token_bridge_contract": "0x5acb5977f35b1A91C4fE0F4386eB669E046776F2",
       "databank_contract": "0x0000000000000000000000000000000000000000",
       "layer_rpc_url": "https://node-palmito.tellorlayer.com",
       "evm_rpc_url": "${EVM_RPC_URL_SEPOLIA}",

@@ -135,6 +135,10 @@ class Config:
             )
         else:
             return self.config_manager.get_bridge_contract()
+
+    def get_token_bridge_address(self) -> str:
+        """Get token bridge contract address"""
+        return self.config_manager.get_token_bridge_contract()
     
     def get_chain_id(self) -> str:
         """Get chain ID"""
@@ -233,6 +237,9 @@ def get_layer_rpc_url() -> str:
 
 def get_bridge_address() -> str:
     return config.get_bridge_address()
+
+def get_token_bridge_address() -> str:
+    return config.get_token_bridge_address()
 
 def get_chain_id() -> str:
     return config.get_chain_id()
