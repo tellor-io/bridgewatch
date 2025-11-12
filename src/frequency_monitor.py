@@ -19,7 +19,7 @@ import requests
 import logging
 import json
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Optional, Dict, Any, List
 from web3 import Web3
 import pytz
@@ -75,6 +75,17 @@ class FrequencyMonitor:
             # set up timezones
             self.utc_tz = pytz.timezone('UTC')
             self.eastern_tz = pytz.timezone('US/Eastern')
+
+            # set up state storage for last report date
+            data_dir = Path(self.config_manager.get_data_dir())
+            frequency_dir = data_dir / "frequency"
+            frequency_dir.mkdir(parents=True, exist_ok=True)
+            self.state_file = frequency_dir / "last_frequency_report.json"
+            self.last_report_date_et: Optional[date] = self._load_last_report_date()
+            if self.last_report_date_et:
+                logger.info(f"Last frequency report date (ET): {self.last_report_date_et.isoformat()}")
+            else:
+                logger.info(f"No prior frequency report state recorded; first eligible run will send report")
             
             logger.info(f"Initialized FrequencyMonitor for {self.layer_chain} → {self.evm_chain}")
             logger.info(f"DataBank contract: {self.databank_contract_address}")
@@ -159,15 +170,43 @@ class FrequencyMonitor:
         
         return f"{utc_str} ({eastern_str})"
     
+    def _load_last_report_date(self) -> Optional[date]:
+        """Load the last report date (ET) from the state file"""
+        try:
+            if self.state_file.exists():
+                with open(self.state_file, 'r') as f:
+                    state = json.load(f)
+                last_date = state.get("last_report_date_et")
+                if last_date:
+                    return datetime.strptime(last_date, '%Y-%m-%d').date()
+            else:
+                logger.info(f"No frequency state file found, will create {self.state_file}")
+        except Exception as e:
+            logger.warning(f"Failed to load last report date from {self.state_file}: {e}")
+        return None
+
+    def _save_last_report_date(self, report_date: date):
+        """Persist the last report date (ET) to the state file"""
+        try:
+            state = {
+                "last_report_date_et": report_date.strftime('%Y-%m-%d'),
+                "updated_at": int(time.time() * 1000)
+            }
+            with open(self.state_file, 'w') as f:
+                json.dump(state, f, indent=2)
+            logger.debug(f"Saved last report date {report_date.isoformat()} to {self.state_file}")
+        except Exception as e:
+            logger.error(f"Failed to save last report date to {self.state_file}: {e}")
+
     def _is_report_time(self) -> bool:
-        """Check if it's time to send the daily report (every day at 9am ET)"""
+        """Check if it's time to send the daily report (once per ET calendar day)"""
         now_et = datetime.now(self.eastern_tz)
-        
-        # Check if it's 9am ET (any day of the week)
-        if now_et.hour == 9 and now_et.minute < 5:  # 5-minute window to avoid multiple reports
-            return True
-        
-        return False
+        current_date = now_et.date()
+
+        if self.last_report_date_et == current_date:
+            return False
+
+        return True
     
     def _get_time_period(self, days: int) -> tuple[int, int]:
         """Get start and end timestamps for the reporting period
@@ -359,6 +398,9 @@ class FrequencyMonitor:
             
             if report:
                 logger.info(f"Report generated successfully - {report['total_reports']} total reports")
+                report_date = datetime.now(self.eastern_tz).date()
+                self.last_report_date_et = report_date
+                self._save_last_report_date(report_date)
                 self.send_discord_report(report)
                 return report
             else:
@@ -378,7 +420,7 @@ class FrequencyMonitor:
         interval_seconds = interval_minutes * 60
         
         logger.info(f"Starting continuous frequency monitoring (interval: {interval_minutes}m, report period: {days}d)")
-        logger.info("Daily reports scheduled for 9am ET every day")
+        logger.info("Daily reports will fire once per ET calendar day after midnight")
         
         try:
             while True:
