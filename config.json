@@ -28,10 +28,10 @@
     "sepolia": {
       "display_name": "Layer Testnet 4 → Sepolia Bridge",
       "layer_chain": "layertest-4",
-      "evm_chain": "sepolia", 
-      "bridge_contract": "0xC69f43741D379cE93bdaAC9b5135EA3e697df1F8",
-      "token_bridge_contract": "0x5acb5977f35b1A91C4fE0F4386eB669E046776F2",
-      "databank_contract": "0x0000000000000000000000000000000000000000",
+      "evm_chain": "sepolia",
+      "bridge_contract": "0x219255BcC07FA116A27b9303222A8003A0fEd394",
+      "token_bridge_contract": "0x62733e63499a25E35844c91275d4c3bdb159D29d",
+      "databank_contract": "0xF03B401966eF4c32e7Cef769c4BB2833BaC0eb9a",
       "layer_rpc_url": "https://node-palmito.tellorlayer.com",
       "evm_rpc_url": "${EVM_RPC_URL_SEPOLIA}",
       "evm_rpc_urls": [
